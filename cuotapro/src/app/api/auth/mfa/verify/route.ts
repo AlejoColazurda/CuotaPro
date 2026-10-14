@@ -63,7 +63,7 @@ export async function POST(request: NextRequest) {
       .update({ 
         totp_enabled: true,
         totp_verified_at: new Date().toISOString(),
-      })
+      } as Record<string, unknown>)
       .eq('id', user.id);
 
     return NextResponse.json({

@@ -18,13 +18,13 @@ export async function POST(request: NextRequest) {
         .from('user_profiles')
         .select('id')
         .eq('email', email)
-        .single();
+        .single() as { data: { id: string } | null };
 
       if (users) {
         const { data: passkeys } = await supabase
           .from('passkeys')
           .select('credential_id, transports')
-          .eq('user_id', users.id);
+          .eq('user_id', users.id) as { data: { credential_id: string; transports: string[] | null }[] | null };
 
         allowCredentials = passkeys?.map((p) => ({
           id: p.credential_id,

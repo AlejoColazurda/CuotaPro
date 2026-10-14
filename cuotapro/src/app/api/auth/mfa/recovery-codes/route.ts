@@ -31,7 +31,7 @@ export async function POST() {
       .from('user_profiles')
       .select('totp_enabled')
       .eq('id', user.id)
-      .single();
+      .single() as { data: { totp_enabled: boolean } | null };
 
     if (!profile?.totp_enabled) {
       return NextResponse.json(
@@ -45,7 +45,7 @@ export async function POST() {
 
     await supabase
       .from('user_profiles')
-      .update({ recovery_codes: hashedCodes })
+      .update({ recovery_codes: hashedCodes } as Record<string, unknown>)
       .eq('id', user.id);
 
     return NextResponse.json({
@@ -85,7 +85,7 @@ export async function PUT(request: NextRequest) {
       .from('user_profiles')
       .select('recovery_codes')
       .eq('id', user.id)
-      .single();
+      .single() as { data: { recovery_codes: string[] | null } | null };
 
     if (!profile?.recovery_codes || profile.recovery_codes.length === 0) {
       return NextResponse.json(
@@ -109,7 +109,7 @@ export async function PUT(request: NextRequest) {
 
     await supabase
       .from('user_profiles')
-      .update({ recovery_codes: updatedCodes })
+      .update({ recovery_codes: updatedCodes } as Record<string, unknown>)
       .eq('id', user.id);
 
     return NextResponse.json({

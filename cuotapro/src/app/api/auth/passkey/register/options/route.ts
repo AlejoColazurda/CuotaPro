@@ -5,6 +5,11 @@ import { createClient } from '@/lib/supabase/server';
 const rpName = 'CuotaPro';
 const rpID = process.env.WEBAUTHN_RP_ID || 'localhost';
 
+interface ExistingPasskey {
+  credential_id: string;
+  transports: string[] | null;
+}
+
 export async function POST() {
   try {
     const supabase = await createClient();
@@ -17,7 +22,7 @@ export async function POST() {
     const { data: existingPasskeys } = await supabase
       .from('passkeys')
       .select('credential_id, transports')
-      .eq('user_id', user.id);
+      .eq('user_id', user.id) as { data: ExistingPasskey[] | null };
 
     const options = await generateRegistrationOptions({
       rpName,

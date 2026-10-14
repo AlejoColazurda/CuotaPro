@@ -115,7 +115,11 @@ export default function NewPlanPage() {
           .eq('tenant_id', tenantUser.tenant_id)
           .eq('is_active', true)
           .order('name'),
-      ]);
+      ]) as [
+        { data: { default_grace_days: number; default_penalty_rate: number; max_penalty_cap: number } | null },
+        { data: Client[] | null },
+        { data: Portfolio[] | null }
+      ];
 
       if (tenantRes.data) {
         setValue('grace_days', tenantRes.data.default_grace_days);
@@ -125,7 +129,6 @@ export default function NewPlanPage() {
 
       setClients(clientsRes.data || []);
       setPortfolios(portfoliosRes.data || []);
-      setIsLoading(false);
     };
 
     fetchData();
@@ -190,11 +193,11 @@ export default function NewPlanPage() {
 
       const { data: plan, error: planError } = await supabase
         .from('plans')
-        .insert(planData)
+        .insert(planData as Record<string, unknown>)
         .select()
-        .single();
+        .single() as { data: { id: string } | null; error: unknown };
 
-      if (planError) throw planError;
+      if (planError || !plan) throw planError;
 
       const installmentsData = simulation.installments.map((inst) => ({
         plan_id: plan.id,
@@ -211,7 +214,7 @@ export default function NewPlanPage() {
 
       const { error: installmentsError } = await supabase
         .from('installments')
-        .insert(installmentsData);
+        .insert(installmentsData as Record<string, unknown>[]);
 
       if (installmentsError) throw installmentsError;
 
@@ -221,7 +224,7 @@ export default function NewPlanPage() {
         entity_type: 'plan',
         entity_id: plan.id,
         new_data: planData,
-      });
+      } as Record<string, unknown>);
 
       toast.success('Plan creado como borrador');
       router.push(`/plans/${plan.id}`);

@@ -31,8 +31,7 @@ jobs:
 
       - name: Type check
         working-directory: cuotapro
-        run: npm run typecheck || true
-        continue-on-error: true
+        run: npm run typecheck
 
       - name: Run tests
         working-directory: cuotapro

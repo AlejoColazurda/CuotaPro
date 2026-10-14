@@ -50,7 +50,7 @@ export async function POST(request: NextRequest) {
       device_type: credentialDeviceType,
       transports: credential.response.transports,
       name: name || 'Mi dispositivo',
-    });
+    } as Record<string, unknown>);
 
     if (insertError) {
       console.error('Error saving passkey:', insertError);
@@ -69,7 +69,7 @@ export async function POST(request: NextRequest) {
       action: 'passkey_registered',
       entity_type: 'passkey',
       new_data: { device_type: credentialDeviceType, name },
-    });
+    } as Record<string, unknown>);
 
     return NextResponse.json({ verified: true });
   } catch (error) {
