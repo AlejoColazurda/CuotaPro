@@ -6,12 +6,33 @@
 --   - Prevent tenant hopping via UPDATE
 --   - Secure payment recording via RPC only
 --   - Audit log writes via RPC only
+--   - Block status/total changes outside SECURITY DEFINER
 
 -- ============================================================================
 -- EXTENSIONS (in extensions schema for security)
 -- ============================================================================
 
 CREATE EXTENSION IF NOT EXISTS unaccent WITH SCHEMA extensions;
+
+-- ============================================================================
+-- FIX get_user_tenant_ids: add search_path and proper grants
+-- ============================================================================
+
+CREATE OR REPLACE FUNCTION public.get_user_tenant_ids()
+RETURNS UUID[]
+LANGUAGE sql
+SECURITY DEFINER
+STABLE
+SET search_path = ''
+AS $$
+  SELECT COALESCE(array_agg(tenant_id), '{}')
+  FROM public.tenant_users
+  WHERE user_id = auth.uid();
+$$;
+
+REVOKE ALL ON FUNCTION public.get_user_tenant_ids() FROM PUBLIC;
+REVOKE ALL ON FUNCTION public.get_user_tenant_ids() FROM anon;
+GRANT EXECUTE ON FUNCTION public.get_user_tenant_ids() TO authenticated;
 
 -- ============================================================================
 -- IMMUTABLE FIELD TRIGGERS (prevent tenant hopping)
@@ -80,7 +101,7 @@ CREATE TRIGGER portfolios_immutable
   FOR EACH ROW
   EXECUTE FUNCTION public.portfolios_immutable_check();
 
--- plans: prevent changes to tenant_id and client_id
+-- plans: prevent changes to tenant_id, client_id, AND status/total outside SECURITY DEFINER
 CREATE OR REPLACE FUNCTION public.plans_immutable_check()
 RETURNS TRIGGER
 LANGUAGE plpgsql
@@ -92,6 +113,15 @@ BEGIN
   END IF;
   IF NEW.client_id IS DISTINCT FROM OLD.client_id THEN
     RAISE EXCEPTION 'Cannot change client_id' USING ERRCODE = '23514';
+  END IF;
+  -- Block status/total_amount_cents changes unless called from SECURITY DEFINER (current_setting returns null in definer)
+  IF current_setting('rls.bypass_plan_check', true) IS DISTINCT FROM 'true' THEN
+    IF NEW.status IS DISTINCT FROM OLD.status THEN
+      RAISE EXCEPTION 'Cannot change plan status directly; use activate_plan/cancel_plan RPC' USING ERRCODE = '23514';
+    END IF;
+    IF NEW.total_amount_cents IS DISTINCT FROM OLD.total_amount_cents THEN
+      RAISE EXCEPTION 'Cannot change total_amount_cents directly; use edit_installment RPC' USING ERRCODE = '23514';
+    END IF;
   END IF;
   RETURN NEW;
 END;
@@ -231,7 +261,6 @@ BEGIN
 END;
 $$;
 
--- Revoke from all, grant only to authenticated
 REVOKE ALL ON FUNCTION public.is_tenant_owner(UUID) FROM PUBLIC;
 REVOKE ALL ON FUNCTION public.is_tenant_owner(UUID) FROM anon;
 GRANT EXECUTE ON FUNCTION public.is_tenant_owner(UUID) TO authenticated;
@@ -253,12 +282,12 @@ BEGIN
 END;
 $$;
 
--- Revoke from all, grant only to authenticated
 REVOKE ALL ON FUNCTION public.is_tenant_member(UUID) FROM PUBLIC;
 REVOKE ALL ON FUNCTION public.is_tenant_member(UUID) FROM anon;
 GRANT EXECUTE ON FUNCTION public.is_tenant_member(UUID) TO authenticated;
 
 -- Generate a unique slug from a business name (internal use only)
+-- Uses advisory lock to prevent race conditions
 CREATE OR REPLACE FUNCTION public.generate_unique_slug(p_name TEXT)
 RETURNS TEXT
 LANGUAGE plpgsql
@@ -269,29 +298,27 @@ DECLARE
   v_base_slug TEXT;
   v_slug TEXT;
   v_suffix INTEGER := 2;
+  v_lock_key BIGINT;
 BEGIN
   -- Normalize: lowercase first, then remove accents, then clean
   v_base_slug := lower(trim(COALESCE(p_name, '')));
   v_base_slug := extensions.unaccent(v_base_slug);
-  -- Remove non-alphanumeric except spaces and hyphens
   v_base_slug := regexp_replace(v_base_slug, '[^a-z0-9\s-]', '', 'g');
-  -- Replace spaces with hyphens
   v_base_slug := regexp_replace(v_base_slug, '\s+', '-', 'g');
-  -- Collapse multiple hyphens
   v_base_slug := regexp_replace(v_base_slug, '-+', '-', 'g');
-  -- Remove leading/trailing hyphens
   v_base_slug := regexp_replace(v_base_slug, '^-|-$', '', 'g');
-  -- Limit length
   v_base_slug := left(v_base_slug, 50);
   
-  -- If empty, use fallback
   IF v_base_slug = '' THEN
     v_base_slug := 'negocio';
   END IF;
   
+  -- Use advisory lock to prevent race conditions on slug generation
+  v_lock_key := hashtext(v_base_slug);
+  PERFORM pg_advisory_xact_lock(v_lock_key);
+  
   v_slug := v_base_slug;
   
-  -- Find unique slug (suffix starts at 2)
   WHILE EXISTS (SELECT 1 FROM public.tenants WHERE slug = v_slug) LOOP
     v_slug := v_base_slug || '-' || v_suffix;
     v_suffix := v_suffix + 1;
@@ -305,13 +332,13 @@ BEGIN
 END;
 $$;
 
--- This is an internal function, revoke from everyone
 REVOKE ALL ON FUNCTION public.generate_unique_slug(TEXT) FROM PUBLIC;
 REVOKE ALL ON FUNCTION public.generate_unique_slug(TEXT) FROM anon;
 REVOKE ALL ON FUNCTION public.generate_unique_slug(TEXT) FROM authenticated;
 
 -- ============================================================================
 -- MAIN FUNCTION: Create tenant with owner (atomic, bypasses RLS)
+-- Handles unique_violation with retry
 -- ============================================================================
 
 CREATE OR REPLACE FUNCTION public.create_tenant_with_owner(
@@ -328,44 +355,51 @@ DECLARE
   v_email TEXT;
   v_slug TEXT;
   v_tenant_id UUID;
+  v_retries INTEGER := 0;
 BEGIN
-  -- Get current user
   v_user_id := auth.uid();
   IF v_user_id IS NULL THEN
     RAISE EXCEPTION 'Not authenticated' USING ERRCODE = 'P0001';
   END IF;
   
-  -- Get user email from auth.users
   SELECT email INTO v_email FROM auth.users WHERE id = v_user_id;
   IF v_email IS NULL THEN
     RAISE EXCEPTION 'User email not found' USING ERRCODE = 'P0001';
   END IF;
   
-  -- Check if user is already an owner of any tenant
   IF EXISTS (SELECT 1 FROM public.tenant_users WHERE user_id = v_user_id AND role = 'owner') THEN
     RAISE EXCEPTION 'User is already an owner of a tenant' USING ERRCODE = '23505';
   END IF;
   
-  -- Generate unique slug
-  v_slug := public.generate_unique_slug(p_name);
+  -- Retry loop for slug uniqueness race condition
+  LOOP
+    v_slug := public.generate_unique_slug(p_name);
+    
+    BEGIN
+      INSERT INTO public.user_profiles (id, email, full_name)
+      VALUES (v_user_id, v_email, p_full_name)
+      ON CONFLICT (id) DO UPDATE SET
+        full_name = COALESCE(EXCLUDED.full_name, public.user_profiles.full_name),
+        updated_at = NOW();
+      
+      INSERT INTO public.tenants (name, slug, email)
+      VALUES (p_name, v_slug, v_email)
+      RETURNING id INTO v_tenant_id;
+      
+      INSERT INTO public.tenant_users (tenant_id, user_id, role)
+      VALUES (v_tenant_id, v_user_id, 'owner');
+      
+      EXIT; -- Success, exit loop
+    EXCEPTION
+      WHEN unique_violation THEN
+        v_retries := v_retries + 1;
+        IF v_retries > 5 THEN
+          RAISE EXCEPTION 'Failed to generate unique slug after % retries', v_retries;
+        END IF;
+        -- Continue loop to retry with new slug
+    END;
+  END LOOP;
   
-  -- Upsert user profile
-  INSERT INTO public.user_profiles (id, email, full_name)
-  VALUES (v_user_id, v_email, p_full_name)
-  ON CONFLICT (id) DO UPDATE SET
-    full_name = COALESCE(EXCLUDED.full_name, public.user_profiles.full_name),
-    updated_at = NOW();
-  
-  -- Create tenant
-  INSERT INTO public.tenants (name, slug, email)
-  VALUES (p_name, v_slug, v_email)
-  RETURNING id INTO v_tenant_id;
-  
-  -- Link user as owner
-  INSERT INTO public.tenant_users (tenant_id, user_id, role)
-  VALUES (v_tenant_id, v_user_id, 'owner');
-  
-  -- Return result
   RETURN json_build_object(
     'tenant_id', v_tenant_id,
     'slug', v_slug
@@ -373,19 +407,19 @@ BEGIN
 END;
 $$;
 
--- Revoke from all, grant only to authenticated
 REVOKE ALL ON FUNCTION public.create_tenant_with_owner(TEXT, TEXT) FROM PUBLIC;
 REVOKE ALL ON FUNCTION public.create_tenant_with_owner(TEXT, TEXT) FROM anon;
 GRANT EXECUTE ON FUNCTION public.create_tenant_with_owner(TEXT, TEXT) TO authenticated;
 
 -- ============================================================================
--- FUNCTION: Register payment (secure, with validation and audit)
+-- FUNCTION: Register payment (secure, with validation, locking, and audit)
+-- Uses BIGINT for cents, proper enum type for status
 -- ============================================================================
 
 CREATE OR REPLACE FUNCTION public.register_payment(
   p_installment_id UUID,
-  p_amount_cents INTEGER,
-  p_penalty_paid_cents INTEGER DEFAULT 0,
+  p_amount_cents BIGINT,
+  p_penalty_paid_cents BIGINT DEFAULT 0,
   p_method TEXT DEFAULT NULL,
   p_reference TEXT DEFAULT NULL,
   p_notes TEXT DEFAULT NULL
@@ -399,23 +433,21 @@ DECLARE
   v_user_id UUID;
   v_plan_id UUID;
   v_tenant_id UUID;
-  v_plan_status TEXT;
-  v_installment_total INTEGER;
-  v_installment_paid INTEGER;
+  v_plan_status public.plan_status;
+  v_installment_total BIGINT;
+  v_installment_paid BIGINT;
   v_installment_number INTEGER;
-  v_outstanding INTEGER;
-  v_new_paid INTEGER;
-  v_new_status TEXT;
+  v_outstanding BIGINT;
+  v_new_paid BIGINT;
+  v_new_status public.payment_status;
   v_payment_id UUID;
   v_all_paid BOOLEAN;
 BEGIN
-  -- Get current user
   v_user_id := auth.uid();
   IF v_user_id IS NULL THEN
     RAISE EXCEPTION 'No autenticado' USING ERRCODE = 'P0001';
   END IF;
   
-  -- Validate input
   IF p_amount_cents IS NULL OR p_amount_cents <= 0 THEN
     RAISE EXCEPTION 'El monto debe ser mayor a cero' USING ERRCODE = 'P0002';
   END IF;
@@ -428,7 +460,7 @@ BEGIN
     RAISE EXCEPTION 'Los punitorios no pueden ser negativos' USING ERRCODE = 'P0002';
   END IF;
   
-  -- Get installment and plan info
+  -- Lock plan and installment rows to prevent concurrent modifications
   SELECT 
     i.plan_id,
     i.total_cents,
@@ -445,23 +477,21 @@ BEGIN
     v_plan_status
   FROM public.installments i
   JOIN public.plans p ON p.id = i.plan_id
-  WHERE i.id = p_installment_id;
+  WHERE i.id = p_installment_id
+  FOR UPDATE OF i, p;
   
   IF v_plan_id IS NULL THEN
     RAISE EXCEPTION 'Cuota no encontrada' USING ERRCODE = 'P0003';
   END IF;
   
-  -- Check tenant membership
   IF NOT public.is_tenant_member(v_tenant_id) THEN
     RAISE EXCEPTION 'No tenés acceso a este plan' USING ERRCODE = '42501';
   END IF;
   
-  -- Check plan is active
   IF v_plan_status != 'active' THEN
     RAISE EXCEPTION 'Solo podés registrar pagos en planes activos' USING ERRCODE = 'P0004';
   END IF;
   
-  -- Calculate outstanding and check for overpayment
   v_outstanding := v_installment_total - v_installment_paid;
   
   IF p_amount_cents > v_outstanding THEN
@@ -471,15 +501,14 @@ BEGIN
     USING ERRCODE = 'P0005';
   END IF;
   
-  -- Calculate new paid amount and status
   v_new_paid := v_installment_paid + p_amount_cents;
   IF v_new_paid >= v_installment_total THEN
-    v_new_status := 'paid';
+    v_new_status := 'paid'::public.payment_status;
   ELSE
-    v_new_status := 'partial';
+    v_new_status := 'partial'::public.payment_status;
   END IF;
   
-  -- Insert payment record
+  -- Insert payment record (penalty_paid_cents stored in payment, NOT added to installment)
   INSERT INTO public.payments (
     tenant_id,
     plan_id,
@@ -502,11 +531,10 @@ BEGIN
     v_user_id
   ) RETURNING id INTO v_payment_id;
   
-  -- Update installment
+  -- Update installment (paid_cents only, penalty tracked in payment record)
   UPDATE public.installments
   SET 
     paid_cents = v_new_paid,
-    penalty_cents = penalty_cents + p_penalty_paid_cents,
     status = v_new_status,
     updated_at = NOW()
   WHERE id = p_installment_id;
@@ -517,11 +545,13 @@ BEGIN
     WHERE plan_id = v_plan_id AND status != 'paid'
   ) INTO v_all_paid;
   
-  -- Mark plan as completed if all paid
+  -- Mark plan as completed if all paid (bypass trigger check)
   IF v_all_paid THEN
+    PERFORM set_config('rls.bypass_plan_check', 'true', true);
     UPDATE public.plans
     SET status = 'completed', updated_at = NOW()
     WHERE id = v_plan_id;
+    PERFORM set_config('rls.bypass_plan_check', '', true);
   END IF;
   
   -- Write audit log
@@ -547,36 +577,28 @@ BEGIN
     )
   );
   
-  -- Return result
   RETURN json_build_object(
     'payment_id', v_payment_id,
-    'installment_status', v_new_status,
+    'installment_status', v_new_status::text,
     'plan_completed', v_all_paid
   );
 END;
 $$;
 
-REVOKE ALL ON FUNCTION public.register_payment(UUID, INTEGER, INTEGER, TEXT, TEXT, TEXT) FROM PUBLIC;
-REVOKE ALL ON FUNCTION public.register_payment(UUID, INTEGER, INTEGER, TEXT, TEXT, TEXT) FROM anon;
-GRANT EXECUTE ON FUNCTION public.register_payment(UUID, INTEGER, INTEGER, TEXT, TEXT, TEXT) TO authenticated;
+REVOKE ALL ON FUNCTION public.register_payment(UUID, BIGINT, BIGINT, TEXT, TEXT, TEXT) FROM PUBLIC;
+REVOKE ALL ON FUNCTION public.register_payment(UUID, BIGINT, BIGINT, TEXT, TEXT, TEXT) FROM anon;
+GRANT EXECUTE ON FUNCTION public.register_payment(UUID, BIGINT, BIGINT, TEXT, TEXT, TEXT) TO authenticated;
 
-COMMENT ON FUNCTION public.register_payment(UUID, INTEGER, INTEGER, TEXT, TEXT, TEXT) IS 
-'Registra un pago para una cuota. Valida que el plan esté activo, el usuario sea miembro del tenant, y no se exceda el saldo pendiente.
+COMMENT ON FUNCTION public.register_payment(UUID, BIGINT, BIGINT, TEXT, TEXT, TEXT) IS 
+'Registra un pago para una cuota. Valida plan activo, tenant membership, y saldo.
 Argumentos:
   p_installment_id: ID de la cuota
-  p_amount_cents: Monto del pago en centavos (requerido, > 0)
-  p_penalty_paid_cents: Punitorios pagados en centavos (opcional, default 0)
-  p_method: Método de pago (payment_method column, opcional)
+  p_amount_cents: Monto del pago en centavos (BIGINT, > 0)
+  p_penalty_paid_cents: Punitorios pagados (BIGINT, default 0, registrado en payment)
+  p_method: Método de pago (opcional)
   p_reference: Referencia/comprobante (opcional)
   p_notes: Notas adicionales (opcional)
-Retorna JSON: { payment_id, installment_status, plan_completed }
-Errores:
-  P0001: No autenticado
-  P0002: Parámetros inválidos
-  P0003: Cuota no encontrada
-  P0004: Plan no activo
-  P0005: Sobrepago
-  42501: Sin acceso al tenant';
+Retorna JSON: { payment_id, installment_status, plan_completed }';
 
 -- ============================================================================
 -- FUNCTION: Activate plan (secure, with audit)
@@ -591,16 +613,16 @@ AS $$
 DECLARE
   v_user_id UUID;
   v_tenant_id UUID;
-  v_status TEXT;
+  v_status public.plan_status;
 BEGIN
   v_user_id := auth.uid();
   IF v_user_id IS NULL THEN
     RAISE EXCEPTION 'No autenticado' USING ERRCODE = 'P0001';
   END IF;
   
-  -- Get plan info
   SELECT tenant_id, status INTO v_tenant_id, v_status
-  FROM public.plans WHERE id = p_plan_id;
+  FROM public.plans WHERE id = p_plan_id
+  FOR UPDATE;
   
   IF v_tenant_id IS NULL THEN
     RAISE EXCEPTION 'Plan no encontrado' USING ERRCODE = 'P0003';
@@ -614,12 +636,13 @@ BEGIN
     RAISE EXCEPTION 'Solo podés activar planes en borrador' USING ERRCODE = 'P0004';
   END IF;
   
-  -- Activate plan
+  -- Bypass trigger check for status change
+  PERFORM set_config('rls.bypass_plan_check', 'true', true);
   UPDATE public.plans
   SET status = 'active', activated_at = NOW(), updated_at = NOW()
   WHERE id = p_plan_id;
+  PERFORM set_config('rls.bypass_plan_check', '', true);
   
-  -- Audit log
   INSERT INTO public.audit_log (tenant_id, user_id, action, entity_type, entity_id)
   VALUES (v_tenant_id, v_user_id, 'plan_activated', 'plan', p_plan_id);
   
@@ -644,7 +667,7 @@ AS $$
 DECLARE
   v_user_id UUID;
   v_tenant_id UUID;
-  v_status TEXT;
+  v_status public.plan_status;
 BEGIN
   v_user_id := auth.uid();
   IF v_user_id IS NULL THEN
@@ -652,7 +675,8 @@ BEGIN
   END IF;
   
   SELECT tenant_id, status INTO v_tenant_id, v_status
-  FROM public.plans WHERE id = p_plan_id;
+  FROM public.plans WHERE id = p_plan_id
+  FOR UPDATE;
   
   IF v_tenant_id IS NULL THEN
     RAISE EXCEPTION 'Plan no encontrado' USING ERRCODE = 'P0003';
@@ -666,12 +690,12 @@ BEGIN
     RAISE EXCEPTION 'No podés cancelar un plan en estado %', v_status USING ERRCODE = 'P0004';
   END IF;
   
-  -- Cancel plan
+  PERFORM set_config('rls.bypass_plan_check', 'true', true);
   UPDATE public.plans
   SET status = 'cancelled', cancelled_at = NOW(), updated_at = NOW()
   WHERE id = p_plan_id;
+  PERFORM set_config('rls.bypass_plan_check', '', true);
   
-  -- Audit log
   INSERT INTO public.audit_log (tenant_id, user_id, action, entity_type, entity_id)
   VALUES (v_tenant_id, v_user_id, 'plan_cancelled', 'plan', p_plan_id);
   
@@ -690,7 +714,7 @@ GRANT EXECUTE ON FUNCTION public.cancel_plan(UUID) TO authenticated;
 CREATE OR REPLACE FUNCTION public.edit_installment(
   p_installment_id UUID,
   p_due_date DATE DEFAULT NULL,
-  p_total_cents INTEGER DEFAULT NULL
+  p_total_cents BIGINT DEFAULT NULL
 )
 RETURNS JSON
 LANGUAGE plpgsql
@@ -701,17 +725,16 @@ DECLARE
   v_user_id UUID;
   v_tenant_id UUID;
   v_plan_id UUID;
-  v_plan_status TEXT;
+  v_plan_status public.plan_status;
   v_old_due_date DATE;
-  v_old_total_cents INTEGER;
-  v_new_plan_total INTEGER;
+  v_old_total_cents BIGINT;
+  v_new_plan_total BIGINT;
 BEGIN
   v_user_id := auth.uid();
   IF v_user_id IS NULL THEN
     RAISE EXCEPTION 'No autenticado' USING ERRCODE = 'P0001';
   END IF;
   
-  -- Get installment and plan info
   SELECT 
     i.plan_id,
     i.due_date,
@@ -726,7 +749,8 @@ BEGIN
     v_plan_status
   FROM public.installments i
   JOIN public.plans p ON p.id = i.plan_id
-  WHERE i.id = p_installment_id;
+  WHERE i.id = p_installment_id
+  FOR UPDATE OF i, p;
   
   IF v_plan_id IS NULL THEN
     RAISE EXCEPTION 'Cuota no encontrada' USING ERRCODE = 'P0003';
@@ -740,12 +764,10 @@ BEGIN
     RAISE EXCEPTION 'Solo podés editar cuotas de planes en borrador' USING ERRCODE = 'P0004';
   END IF;
   
-  -- Validate
   IF p_total_cents IS NOT NULL AND p_total_cents <= 0 THEN
     RAISE EXCEPTION 'El monto debe ser mayor a cero' USING ERRCODE = 'P0002';
   END IF;
   
-  -- Update installment
   UPDATE public.installments
   SET 
     due_date = COALESCE(p_due_date, due_date),
@@ -753,17 +775,17 @@ BEGIN
     updated_at = NOW()
   WHERE id = p_installment_id;
   
-  -- Recalculate plan total if amount changed
   IF p_total_cents IS NOT NULL THEN
     SELECT SUM(total_cents) INTO v_new_plan_total
     FROM public.installments WHERE plan_id = v_plan_id;
     
+    PERFORM set_config('rls.bypass_plan_check', 'true', true);
     UPDATE public.plans
     SET total_amount_cents = v_new_plan_total, updated_at = NOW()
     WHERE id = v_plan_id;
+    PERFORM set_config('rls.bypass_plan_check', '', true);
   END IF;
   
-  -- Audit log
   INSERT INTO public.audit_log (tenant_id, user_id, action, entity_type, entity_id, old_data, new_data)
   VALUES (
     v_tenant_id,
@@ -779,35 +801,36 @@ BEGIN
 END;
 $$;
 
-REVOKE ALL ON FUNCTION public.edit_installment(UUID, DATE, INTEGER) FROM PUBLIC;
-REVOKE ALL ON FUNCTION public.edit_installment(UUID, DATE, INTEGER) FROM anon;
-GRANT EXECUTE ON FUNCTION public.edit_installment(UUID, DATE, INTEGER) TO authenticated;
+REVOKE ALL ON FUNCTION public.edit_installment(UUID, DATE, BIGINT) FROM PUBLIC;
+REVOKE ALL ON FUNCTION public.edit_installment(UUID, DATE, BIGINT) FROM anon;
+GRANT EXECUTE ON FUNCTION public.edit_installment(UUID, DATE, BIGINT) TO authenticated;
 
 -- ============================================================================
 -- FIX RECURSIVE/BROKEN RLS POLICIES
+-- Use DROP POLICY IF EXISTS before each CREATE for re-runnability
 -- ============================================================================
 
--- Drop problematic policies
 DROP POLICY IF EXISTS "Owners can manage tenant members" ON public.tenant_users;
 DROP POLICY IF EXISTS "Owners can update their tenants" ON public.tenants;
 DROP POLICY IF EXISTS "Owners can manage API keys" ON public.api_keys;
+DROP POLICY IF EXISTS "Users can view own tenant membership" ON public.tenant_users;
+DROP POLICY IF EXISTS "Owners can view all tenant members" ON public.tenant_users;
+DROP POLICY IF EXISTS "Owners can insert tenant members" ON public.tenant_users;
+DROP POLICY IF EXISTS "Owners can update tenant members" ON public.tenant_users;
+DROP POLICY IF EXISTS "Owners can delete tenant members" ON public.tenant_users;
 
 -- ============================================================================
 -- TENANT_USERS: Fix recursive policy
--- Note: tenant_id and user_id cannot change (enforced by trigger)
 -- ============================================================================
 
--- Users can view their own membership
 CREATE POLICY "Users can view own tenant membership"
   ON public.tenant_users FOR SELECT
   USING (user_id = auth.uid());
 
--- Owners can view all members of their tenants (using helper to avoid recursion)
 CREATE POLICY "Owners can view all tenant members"
   ON public.tenant_users FOR SELECT
   USING (public.is_tenant_owner(tenant_id));
 
--- Owners can insert new members (but not as owner - owners created via RPC only)
 CREATE POLICY "Owners can insert tenant members"
   ON public.tenant_users FOR INSERT
   WITH CHECK (
@@ -815,8 +838,6 @@ CREATE POLICY "Owners can insert tenant members"
     AND role != 'owner'
   );
 
--- Owners can update members (not themselves, cannot promote to owner)
--- Full constraint in WITH CHECK since tenant_id/user_id are immutable via trigger
 CREATE POLICY "Owners can update tenant members"
   ON public.tenant_users FOR UPDATE
   USING (public.is_tenant_owner(tenant_id) AND user_id != auth.uid())
@@ -826,7 +847,6 @@ CREATE POLICY "Owners can update tenant members"
     AND role != 'owner'
   );
 
--- Owners can delete members (not themselves)
 CREATE POLICY "Owners can delete tenant members"
   ON public.tenant_users FOR DELETE
   USING (public.is_tenant_owner(tenant_id) AND user_id != auth.uid());
@@ -835,25 +855,30 @@ CREATE POLICY "Owners can delete tenant members"
 -- TENANTS: Fix UPDATE policy
 -- ============================================================================
 
-CREATE POLICY "Owners can update their tenants"
+DROP POLICY IF EXISTS "Owners can update their tenants v2" ON public.tenants;
+CREATE POLICY "Owners can update their tenants v2"
   ON public.tenants FOR UPDATE
   USING (public.is_tenant_owner(id))
   WITH CHECK (public.is_tenant_owner(id));
 
 -- ============================================================================
--- API_KEYS: Fix recursive policy (tenant_id immutable via trigger)
+-- API_KEYS: Fix recursive policy
 -- ============================================================================
 
-CREATE POLICY "Owners can manage API keys"
+DROP POLICY IF EXISTS "Owners can manage API keys v2" ON public.api_keys;
+CREATE POLICY "Owners can manage API keys v2"
   ON public.api_keys FOR ALL
   USING (public.is_tenant_owner(tenant_id))
   WITH CHECK (public.is_tenant_owner(tenant_id));
 
 -- ============================================================================
--- PORTFOLIOS: Ensure INSERT works (tenant_id immutable via trigger)
+-- PORTFOLIOS: Ensure INSERT works
 -- ============================================================================
 
 DROP POLICY IF EXISTS "Users can manage portfolios" ON public.portfolios;
+DROP POLICY IF EXISTS "Members can insert portfolios" ON public.portfolios;
+DROP POLICY IF EXISTS "Members can update portfolios" ON public.portfolios;
+DROP POLICY IF EXISTS "Owners can delete portfolios" ON public.portfolios;
 
 CREATE POLICY "Members can insert portfolios"
   ON public.portfolios FOR INSERT
@@ -869,10 +894,13 @@ CREATE POLICY "Owners can delete portfolios"
   USING (public.is_tenant_owner(tenant_id));
 
 -- ============================================================================
--- CLIENTS: Ensure INSERT works (tenant_id immutable via trigger)
+-- CLIENTS: Ensure INSERT works
 -- ============================================================================
 
 DROP POLICY IF EXISTS "Users can manage clients" ON public.clients;
+DROP POLICY IF EXISTS "Members can insert clients" ON public.clients;
+DROP POLICY IF EXISTS "Members can update clients" ON public.clients;
+DROP POLICY IF EXISTS "Owners can delete clients" ON public.clients;
 
 CREATE POLICY "Members can insert clients"
   ON public.clients FOR INSERT
@@ -888,41 +916,53 @@ CREATE POLICY "Owners can delete clients"
   USING (public.is_tenant_owner(tenant_id));
 
 -- ============================================================================
--- PLANS: Ensure INSERT works (tenant_id, client_id immutable via trigger)
+-- PLANS: INSERT and limited UPDATE (status/total blocked by trigger)
 -- ============================================================================
 
 DROP POLICY IF EXISTS "Users can manage plans" ON public.plans;
+DROP POLICY IF EXISTS "Members can insert plans" ON public.plans;
+DROP POLICY IF EXISTS "Members can update plans" ON public.plans;
+DROP POLICY IF EXISTS "Members can delete draft plans" ON public.plans;
+DROP POLICY IF EXISTS "Members can update draft plans" ON public.plans;
 
 CREATE POLICY "Members can insert plans"
   ON public.plans FOR INSERT
   WITH CHECK (public.is_tenant_member(tenant_id));
 
-CREATE POLICY "Members can update plans"
+-- Allow update only on draft plans for non-critical fields (status/total blocked by trigger)
+CREATE POLICY "Members can update draft plans"
   ON public.plans FOR UPDATE
-  USING (public.is_tenant_member(tenant_id))
-  WITH CHECK (public.is_tenant_member(tenant_id));
+  USING (public.is_tenant_member(tenant_id) AND status = 'draft')
+  WITH CHECK (public.is_tenant_member(tenant_id) AND status = 'draft');
 
 CREATE POLICY "Members can delete draft plans"
   ON public.plans FOR DELETE
   USING (public.is_tenant_member(tenant_id) AND status = 'draft');
 
 -- ============================================================================
--- INSTALLMENTS: Fix INSERT/UPDATE/DELETE policies (plan_id immutable via trigger)
+-- INSTALLMENTS: INSERT requires draft plan, pending status, paid_cents=0
 -- ============================================================================
 
 DROP POLICY IF EXISTS "Users can insert installments" ON public.installments;
 DROP POLICY IF EXISTS "Users can manage draft installments" ON public.installments;
+DROP POLICY IF EXISTS "Members can insert installments" ON public.installments;
+DROP POLICY IF EXISTS "Members can update draft installments" ON public.installments;
+DROP POLICY IF EXISTS "Members can delete draft installments" ON public.installments;
 
--- Members can insert installments for their tenant's plans
+-- INSERT: plan must be draft, new installment must be pending with paid_cents=0
 CREATE POLICY "Members can insert installments"
   ON public.installments FOR INSERT
-  WITH CHECK (EXISTS (
-    SELECT 1 FROM public.plans
-    WHERE public.plans.id = installments.plan_id
-    AND public.is_tenant_member(public.plans.tenant_id)
-  ));
+  WITH CHECK (
+    EXISTS (
+      SELECT 1 FROM public.plans
+      WHERE public.plans.id = installments.plan_id
+      AND public.is_tenant_member(public.plans.tenant_id)
+      AND public.plans.status = 'draft'
+    )
+    AND status = 'pending'
+    AND paid_cents = 0
+  );
 
--- Members can update installments ONLY for draft plans
 CREATE POLICY "Members can update draft installments"
   ON public.installments FOR UPDATE
   USING (EXISTS (
@@ -938,7 +978,6 @@ CREATE POLICY "Members can update draft installments"
     AND public.plans.status = 'draft'
   ));
 
--- Members can delete installments from draft plans
 CREATE POLICY "Members can delete draft installments"
   ON public.installments FOR DELETE
   USING (EXISTS (
@@ -949,30 +988,28 @@ CREATE POLICY "Members can delete draft installments"
   ));
 
 -- ============================================================================
--- PAYMENTS: No direct client INSERT/UPDATE/DELETE - only via register_payment RPC
--- tenant_id, plan_id, installment_id all immutable via trigger
+-- PAYMENTS: No direct INSERT/UPDATE/DELETE - only via register_payment RPC
 -- ============================================================================
 
 DROP POLICY IF EXISTS "Users can insert payments" ON public.payments;
 DROP POLICY IF EXISTS "Members can insert payments" ON public.payments;
 
--- SELECT only - viewing payments is allowed for tenant members
--- INSERT/UPDATE/DELETE only via register_payment RPC (SECURITY DEFINER bypasses RLS)
-
 -- ============================================================================
--- AUDIT_LOG: Remove client INSERT policy - audit only via triggers/definer
+-- AUDIT_LOG: Remove client INSERT policy
 -- ============================================================================
 
 DROP POLICY IF EXISTS "System can insert audit log" ON public.audit_log;
 DROP POLICY IF EXISTS "Authenticated users can insert audit log" ON public.audit_log;
 
--- No INSERT policy for clients - audit log written only by SECURITY DEFINER functions or triggers
-
 -- ============================================================================
--- PASSKEYS: Explicit per-operation policies (user_id immutable via trigger)
+-- PASSKEYS: Explicit per-operation policies
 -- ============================================================================
 
 DROP POLICY IF EXISTS "Users can manage own passkeys" ON public.passkeys;
+DROP POLICY IF EXISTS "Users can select own passkeys" ON public.passkeys;
+DROP POLICY IF EXISTS "Users can insert own passkeys" ON public.passkeys;
+DROP POLICY IF EXISTS "Users can update own passkeys" ON public.passkeys;
+DROP POLICY IF EXISTS "Users can delete own passkeys" ON public.passkeys;
 
 CREATE POLICY "Users can select own passkeys"
   ON public.passkeys FOR SELECT
@@ -992,10 +1029,14 @@ CREATE POLICY "Users can delete own passkeys"
   USING (user_id = auth.uid());
 
 -- ============================================================================
--- SESSIONS: Explicit per-operation policies (user_id immutable via trigger)
+-- SESSIONS: Explicit per-operation policies
 -- ============================================================================
 
 DROP POLICY IF EXISTS "Users can manage own sessions" ON public.sessions;
+DROP POLICY IF EXISTS "Users can select own sessions" ON public.sessions;
+DROP POLICY IF EXISTS "Users can insert own sessions" ON public.sessions;
+DROP POLICY IF EXISTS "Users can update own sessions" ON public.sessions;
+DROP POLICY IF EXISTS "Users can delete own sessions" ON public.sessions;
 
 CREATE POLICY "Users can select own sessions"
   ON public.sessions FOR SELECT
@@ -1015,7 +1056,7 @@ CREATE POLICY "Users can delete own sessions"
   USING (user_id = auth.uid());
 
 -- ============================================================================
--- COMMENT: Document the create_tenant_with_owner function
+-- COMMENTS
 -- ============================================================================
 
 COMMENT ON FUNCTION public.create_tenant_with_owner(TEXT, TEXT) IS 

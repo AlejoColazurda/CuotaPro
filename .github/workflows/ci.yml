@@ -87,18 +87,65 @@ jobs:
         run: supabase start
 
       - name: Apply migrations
-        run: supabase db reset --debug
+        run: supabase db reset
 
       - name: Install pgTAP
         run: |
           PGPASSWORD=postgres psql "postgresql://postgres:postgres@127.0.0.1:54322/postgres" -c "CREATE EXTENSION IF NOT EXISTS pgtap;"
 
       - name: Run RLS tests
+        shell: bash
         run: |
+          set -o pipefail
+          FAILED=0
           for test_file in tests/rls/*.sql; do
+            echo "=========================================="
             echo "Running: $test_file"
-            PGPASSWORD=postgres psql "postgresql://postgres:postgres@127.0.0.1:54322/postgres" -f "$test_file"
+            echo "=========================================="
+            
+            # Run test and capture output
+            OUTPUT=$(PGPASSWORD=postgres psql "postgresql://postgres:postgres@127.0.0.1:54322/postgres" \
+              -v ON_ERROR_STOP=1 \
+              -f "$test_file" 2>&1) || {
+              echo "ERROR: Test file $test_file failed with exit code $?"
+              echo "$OUTPUT"
+              FAILED=1
+              continue
+            }
+            
+            echo "$OUTPUT"
+            
+            # Check for 'not ok' in output (failed tests)
+            if echo "$OUTPUT" | grep -q '^not ok'; then
+              echo "ERROR: Found failing tests in $test_file"
+              FAILED=1
+            fi
+            
+            # Check for plan mismatch
+            if echo "$OUTPUT" | grep -q 'Looks like you planned .* tests but ran'; then
+              echo "ERROR: Test plan mismatch in $test_file"
+              FAILED=1
+            fi
+            
+            # Check for incomplete plan
+            if echo "$OUTPUT" | grep -q 'Looks like you failed'; then
+              echo "ERROR: Test failures detected in $test_file"
+              FAILED=1
+            fi
+            
+            echo ""
           done
+          
+          if [ $FAILED -ne 0 ]; then
+            echo "=========================================="
+            echo "RLS TESTS FAILED"
+            echo "=========================================="
+            exit 1
+          fi
+          
+          echo "=========================================="
+          echo "ALL RLS TESTS PASSED"
+          echo "=========================================="
 
       - name: Stop Supabase
         if: always()
