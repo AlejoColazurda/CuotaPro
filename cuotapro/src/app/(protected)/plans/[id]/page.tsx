@@ -38,6 +38,9 @@ import {
   MessageSquare,
   DollarSign,
   AlertTriangle,
+  Edit3,
+  Save,
+  X,
 } from 'lucide-react';
 import { format } from 'date-fns';
 import { es } from 'date-fns/locale';
@@ -69,6 +72,12 @@ const paymentStatusLabels: Record<
   overdue: { label: 'Vencido', variant: 'destructive' },
 };
 
+interface EditableInstallment {
+  id: string;
+  dueDate: string;
+  totalCents: number;
+}
+
 export default function PlanDetailPage() {
   const params = useParams();
   const planId = params.id as string;
@@ -84,6 +93,9 @@ export default function PlanDetailPage() {
   const [selectedInstallment, setSelectedInstallment] = useState<Installment | null>(null);
   const [paymentAmount, setPaymentAmount] = useState('');
   const [isProcessing, setIsProcessing] = useState(false);
+
+  const [editingInstallment, setEditingInstallment] = useState<EditableInstallment | null>(null);
+  const [isSavingEdit, setIsSavingEdit] = useState(false);
 
   const fetchPlan = useCallback(async () => {
     const supabase = createClient();
@@ -332,6 +344,66 @@ export default function PlanDetailPage() {
     window.open(url, '_blank');
   };
 
+  const startEditingInstallment = (installment: Installment) => {
+    setEditingInstallment({
+      id: installment.id,
+      dueDate: installment.due_date.split('T')[0],
+      totalCents: installment.total_cents,
+    });
+  };
+
+  const cancelEditing = () => {
+    setEditingInstallment(null);
+  };
+
+  const saveInstallmentEdit = async () => {
+    if (!editingInstallment || !plan) return;
+    setIsSavingEdit(true);
+
+    const supabase = createClient();
+
+    const { error } = await supabase
+      .from('installments')
+      .update({
+        due_date: editingInstallment.dueDate,
+        total_cents: editingInstallment.totalCents,
+      })
+      .eq('id', editingInstallment.id);
+
+    if (error) {
+      toast.error('Error al guardar cambios');
+    } else {
+      const newTotal = plan.installments.reduce((sum, inst) => {
+        if (inst.id === editingInstallment.id) {
+          return sum + editingInstallment.totalCents;
+        }
+        return sum + inst.total_cents;
+      }, 0);
+
+      await supabase
+        .from('plans')
+        .update({ total_amount_cents: newTotal })
+        .eq('id', plan.id);
+
+      await supabase.from('audit_log').insert({
+        tenant_id: plan.tenant_id,
+        action: 'installment_edited',
+        entity_type: 'installment',
+        entity_id: editingInstallment.id,
+        new_data: {
+          due_date: editingInstallment.dueDate,
+          total_cents: editingInstallment.totalCents,
+        },
+      });
+
+      toast.success('Cuota actualizada');
+      setEditingInstallment(null);
+      fetchPlan();
+    }
+
+    setIsSavingEdit(false);
+  };
+
   if (isLoading) {
     return <LoadingPage message="Cargando plan..." />;
   }
@@ -346,6 +418,8 @@ export default function PlanDetailPage() {
     (i) => i.status !== 'paid' && new Date(i.due_date) < new Date()
   );
 
+  const isDraft = plan.status === 'draft';
+
   return (
     <>
       <PageHeader
@@ -356,7 +430,7 @@ export default function PlanDetailPage() {
         ]}
         actions={
           <div className="flex gap-2">
-            {plan.status === 'draft' && (
+            {isDraft && (
               <>
                 <Button
                   variant="outline"
@@ -420,15 +494,24 @@ export default function PlanDetailPage() {
 
           <Card>
             <CardHeader>
-              <CardTitle>Cuotas</CardTitle>
-              {overdueInstallments.length > 0 && (
-                <div className="flex items-center gap-2 text-red-600">
-                  <AlertTriangle className="h-4 w-4" />
-                  <span className="text-sm">
-                    {overdueInstallments.length} cuota(s) vencida(s)
-                  </span>
+              <div className="flex items-center justify-between">
+                <div>
+                  <CardTitle>Cuotas</CardTitle>
+                  {isDraft && (
+                    <CardDescription className="text-blue-600">
+                      Podés editar las cuotas mientras el plan esté en borrador
+                    </CardDescription>
+                  )}
                 </div>
-              )}
+                {overdueInstallments.length > 0 && (
+                  <div className="flex items-center gap-2 text-red-600">
+                    <AlertTriangle className="h-4 w-4" />
+                    <span className="text-sm">
+                      {overdueInstallments.length} cuota(s) vencida(s)
+                    </span>
+                  </div>
+                )}
+              </div>
             </CardHeader>
             <CardContent>
               <div className="overflow-x-auto">
@@ -448,15 +531,46 @@ export default function PlanDetailPage() {
                       const isOverdue =
                         inst.status !== 'paid' &&
                         new Date(inst.due_date) < new Date();
+                      const isEditing = editingInstallment?.id === inst.id;
 
                       return (
                         <tr key={inst.id} className={isOverdue ? 'bg-red-50' : ''}>
                           <td className="py-3 pr-4 font-medium">{inst.number}</td>
                           <td className="py-3 pr-4">
-                            {format(new Date(inst.due_date), 'dd/MM/yyyy', { locale: es })}
+                            {isEditing ? (
+                              <Input
+                                type="date"
+                                value={editingInstallment.dueDate}
+                                onChange={(e) =>
+                                  setEditingInstallment({
+                                    ...editingInstallment,
+                                    dueDate: e.target.value,
+                                  })
+                                }
+                                className="w-36"
+                              />
+                            ) : (
+                              format(new Date(inst.due_date), 'dd/MM/yyyy', { locale: es })
+                            )}
                           </td>
                           <td className="py-3 pr-4 text-right">
-                            {formatCurrency(inst.total_cents)}
+                            {isEditing ? (
+                              <Input
+                                type="number"
+                                step="0.01"
+                                min="0"
+                                value={(editingInstallment.totalCents / 100).toFixed(2)}
+                                onChange={(e) =>
+                                  setEditingInstallment({
+                                    ...editingInstallment,
+                                    totalCents: Math.round(parseFloat(e.target.value || '0') * 100),
+                                  })
+                                }
+                                className="w-28 text-right"
+                              />
+                            ) : (
+                              formatCurrency(inst.total_cents)
+                            )}
                           </td>
                           <td className="py-3 pr-4 text-right">
                             {formatCurrency(inst.paid_cents)}
@@ -475,6 +589,38 @@ export default function PlanDetailPage() {
                             </Badge>
                           </td>
                           <td className="py-3">
+                            {isDraft && (
+                              isEditing ? (
+                                <div className="flex gap-1">
+                                  <Button
+                                    size="sm"
+                                    variant="ghost"
+                                    onClick={saveInstallmentEdit}
+                                    loading={isSavingEdit}
+                                    className="text-green-600 hover:bg-green-50"
+                                  >
+                                    <Save className="h-4 w-4" />
+                                  </Button>
+                                  <Button
+                                    size="sm"
+                                    variant="ghost"
+                                    onClick={cancelEditing}
+                                    className="text-gray-600 hover:bg-gray-100"
+                                  >
+                                    <X className="h-4 w-4" />
+                                  </Button>
+                                </div>
+                              ) : (
+                                <Button
+                                  size="sm"
+                                  variant="ghost"
+                                  onClick={() => startEditingInstallment(inst)}
+                                  title="Editar cuota"
+                                >
+                                  <Edit3 className="h-4 w-4" />
+                                </Button>
+                              )
+                            )}
                             {inst.status !== 'paid' && plan.status === 'active' && (
                               <div className="flex gap-1">
                                 <Button

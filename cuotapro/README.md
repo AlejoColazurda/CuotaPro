@@ -27,7 +27,9 @@ Sistema de gestión de cobros en cuotas para comercios argentinos. Permite crear
 - Mostrar/ocultar contraseña
 - Recuperación por email
 - Passkeys/WebAuthn (Face ID, Touch ID, biométricos)
-- TOTP 2FA (preparado, UI completa)
+- TOTP 2FA completo (enroll, verify, challenge, disable)
+- Códigos de recuperación (10 códigos, uso único)
+- Rate limiting y bloqueo de cuenta
 - Gestión de sesiones
 
 ### Cumplimiento Legal
@@ -202,10 +204,15 @@ El CFT se calcula usando TIR (Tasa Interna de Retorno) para cumplir con Ley 24.2
 ## Lo que Funciona
 
 - ✅ Autenticación completa (email, passkeys)
+- ✅ TOTP 2FA end-to-end (enroll, verify, challenge, disable)
+- ✅ Códigos de recuperación 2FA
+- ✅ Rate limiting en login, signup, recovery, 2FA
+- ✅ Bloqueo de cuenta por intentos fallidos
 - ✅ CRUD de clientes con validación
 - ✅ CRUD de carteras
 - ✅ Simulador de planes con TNA/TEA/CFT
 - ✅ Creación de planes en borrador
+- ✅ Edición de cuotas en borrador
 - ✅ Activación de planes (inmutabilidad)
 - ✅ Registro de pagos totales/parciales
 - ✅ Cálculo de punitorios
@@ -217,6 +224,7 @@ El CFT se calcula usando TIR (Tasa Interna de Retorno) para cumplir con Ley 24.2
 - ✅ Estados de carga/vacío/error
 - ✅ Confirmaciones en acciones destructivas
 - ✅ Generación de PDFs (recibos y art. 36)
+- ✅ GitHub Actions CI (lint, typecheck, tests, build)
 
 ## Lo que Necesita Credenciales del Owner
 
@@ -227,11 +235,8 @@ El CFT se calcula usando TIR (Tasa Interna de Retorno) para cumplir con Ley 24.2
 
 ## Gaps Conocidos
 
-1. **TOTP 2FA**: UI completa pero backend de verificación pendiente
-2. **Split de Mercado Pago**: Detrás de feature flag, no implementado
-3. **Merchant onboarding**: Preparado pero no implementado
-4. **Edición de cuotas en borrador**: UI pendiente
-5. **Rate limiting de login**: Campos preparados pero no enforced
+1. **Split de Mercado Pago**: Detrás de feature flag, no implementado
+2. **Merchant onboarding**: Preparado pero no implementado
 
 ## Seguridad
 

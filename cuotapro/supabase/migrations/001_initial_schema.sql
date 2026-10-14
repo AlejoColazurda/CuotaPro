@@ -50,6 +50,7 @@ CREATE TABLE user_profiles (
   phone VARCHAR(50),
   totp_secret TEXT,
   totp_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+  totp_verified_at TIMESTAMPTZ,
   recovery_codes TEXT[],
   failed_login_attempts INTEGER NOT NULL DEFAULT 0,
   locked_until TIMESTAMPTZ,

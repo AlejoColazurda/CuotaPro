@@ -58,6 +58,7 @@ export interface Database {
           phone: string | null;
           totp_secret: string | null;
           totp_enabled: boolean;
+          totp_verified_at: string | null;
           recovery_codes: string[] | null;
           failed_login_attempts: number;
           locked_until: string | null;
