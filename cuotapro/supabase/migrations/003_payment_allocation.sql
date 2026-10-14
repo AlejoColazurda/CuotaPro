@@ -259,10 +259,9 @@ BEGIN
   v_apply_principal := LEAST(v_remaining, v_outstanding_principal);
   v_remaining := v_remaining - v_apply_principal;
   
-  -- Determine new status
-  IF (v_principal_paid + v_apply_principal) >= v_principal_cents 
-     AND (v_interest_paid + v_apply_interest) >= v_interest_cents
-     AND (v_admin_fee_paid + v_apply_admin_fee) >= v_admin_fee_cents THEN
+  -- Determine new status based on total paid vs total (maintains backward compatibility)
+  -- The allocation breakdown is tracked for audit purposes but status is based on total
+  IF (v_paid_cents + p_amount_cents) >= v_total_cents THEN
     v_new_status := 'paid'::public.payment_status;
   ELSE
     v_new_status := 'partial'::public.payment_status;
