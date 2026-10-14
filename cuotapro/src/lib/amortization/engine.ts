@@ -35,6 +35,13 @@ export interface AmortizationResult {
   monthlyRate: number;
 }
 
+export class IRRConvergenceError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'IRRConvergenceError';
+  }
+}
+
 function addMonths(date: Date, months: number): Date {
   const result = new Date(date);
   result.setMonth(result.getMonth() + months);
@@ -60,12 +67,15 @@ export function calculateFixedSurcharge(input: AmortizationInput): AmortizationR
   const totalWithInterest = financedAmount.add(totalInterest);
   const totalAmount = totalWithInterest.add(adminFee);
   
-  const adminFeePerInstallment = adminFee.div(n).toDecimalPlaces(0, Decimal.ROUND_HALF_UP);
-  const principalPerInstallment = cashPrice.div(n).toDecimalPlaces(0, Decimal.ROUND_HALF_UP);
-  const interestPerInstallment = totalInterest.div(n).toDecimalPlaces(0, Decimal.ROUND_HALF_UP);
+  // Use ROUND_DOWN for per-installment values to avoid exceeding total
+  const adminFeePerInstallment = adminFee.div(n).toDecimalPlaces(0, Decimal.ROUND_DOWN);
+  const principalPerInstallment = cashPrice.div(n).toDecimalPlaces(0, Decimal.ROUND_DOWN);
+  const interestPerInstallment = totalInterest.div(n).toDecimalPlaces(0, Decimal.ROUND_DOWN);
 
   const installments: InstallmentSchedule[] = [];
   let remainingBalance = cashPrice;
+  let accumulatedFee = new Decimal(0);
+  let accumulatedInterest = new Decimal(0);
 
   for (let i = 1; i <= n; i++) {
     const isLast = i === n;
@@ -75,12 +85,14 @@ export function calculateFixedSurcharge(input: AmortizationInput): AmortizationR
 
     if (isLast) {
       principal = remainingBalance;
-      interest = totalInterest.sub(interestPerInstallment.mul(n - 1));
-      fee = adminFee.sub(adminFeePerInstallment.mul(n - 1));
+      interest = totalInterest.sub(accumulatedInterest);
+      fee = adminFee.sub(accumulatedFee);
     } else {
       principal = principalPerInstallment;
       interest = interestPerInstallment;
       fee = adminFeePerInstallment;
+      accumulatedFee = accumulatedFee.add(fee);
+      accumulatedInterest = accumulatedInterest.add(interest);
     }
 
     remainingBalance = remainingBalance.sub(principal);
@@ -97,7 +109,7 @@ export function calculateFixedSurcharge(input: AmortizationInput): AmortizationR
   }
 
   const monthlyRate = rate.div(n);
-  const { tna, tea, cft } = calculateRates(cashPrice.toNumber(), totalAmount.toNumber(), n);
+  const { tna, tea, cft } = calculateRates(cashPrice.toNumber(), installments, n);
 
   return {
     financedAmountCents: financedAmount.toNumber(),
@@ -123,12 +135,15 @@ export function calculateDirectRate(input: AmortizationInput): AmortizationResul
   const totalWithInterest = financedAmount.add(totalInterest);
   const totalAmount = totalWithInterest.add(adminFee);
 
-  const adminFeePerInstallment = adminFee.div(n).toDecimalPlaces(0, Decimal.ROUND_HALF_UP);
-  const principalPerInstallment = cashPrice.div(n).toDecimalPlaces(0, Decimal.ROUND_HALF_UP);
-  const interestPerInstallment = totalInterest.div(n).toDecimalPlaces(0, Decimal.ROUND_HALF_UP);
+  // Use ROUND_DOWN for per-installment values to avoid exceeding total
+  const adminFeePerInstallment = adminFee.div(n).toDecimalPlaces(0, Decimal.ROUND_DOWN);
+  const principalPerInstallment = cashPrice.div(n).toDecimalPlaces(0, Decimal.ROUND_DOWN);
+  const interestPerInstallment = totalInterest.div(n).toDecimalPlaces(0, Decimal.ROUND_DOWN);
 
   const installments: InstallmentSchedule[] = [];
   let remainingBalance = cashPrice;
+  let accumulatedFee = new Decimal(0);
+  let accumulatedInterest = new Decimal(0);
 
   for (let i = 1; i <= n; i++) {
     const isLast = i === n;
@@ -138,12 +153,14 @@ export function calculateDirectRate(input: AmortizationInput): AmortizationResul
 
     if (isLast) {
       principal = remainingBalance;
-      interest = totalInterest.sub(interestPerInstallment.mul(n - 1));
-      fee = adminFee.sub(adminFeePerInstallment.mul(n - 1));
+      interest = totalInterest.sub(accumulatedInterest);
+      fee = adminFee.sub(accumulatedFee);
     } else {
       principal = principalPerInstallment;
       interest = interestPerInstallment;
       fee = adminFeePerInstallment;
+      accumulatedFee = accumulatedFee.add(fee);
+      accumulatedInterest = accumulatedInterest.add(interest);
     }
 
     remainingBalance = remainingBalance.sub(principal);
@@ -159,7 +176,7 @@ export function calculateDirectRate(input: AmortizationInput): AmortizationResul
     });
   }
 
-  const { tna, tea, cft } = calculateRates(cashPrice.toNumber(), totalAmount.toNumber(), n);
+  const { tna, tea, cft } = calculateRates(cashPrice.toNumber(), installments, n);
 
   return {
     financedAmountCents: financedAmount.toNumber(),
@@ -192,11 +209,13 @@ export function calculateFrenchSystem(input: AmortizationInput): AmortizationRes
   }
   fixedPayment = fixedPayment.toDecimalPlaces(0, Decimal.ROUND_HALF_UP);
 
-  const adminFeePerInstallment = adminFee.div(n).toDecimalPlaces(0, Decimal.ROUND_HALF_UP);
+  // Use ROUND_DOWN for per-installment admin fee to avoid exceeding total
+  const adminFeePerInstallment = adminFee.div(n).toDecimalPlaces(0, Decimal.ROUND_DOWN);
 
   const installments: InstallmentSchedule[] = [];
   let remainingBalance = cashPrice;
   let totalInterest = new Decimal(0);
+  let accumulatedFee = new Decimal(0);
 
   for (let i = 1; i <= n; i++) {
     const isLast = i === n;
@@ -208,11 +227,12 @@ export function calculateFrenchSystem(input: AmortizationInput): AmortizationRes
     if (isLast) {
       principal = remainingBalance;
       payment = principal.add(interest);
-      fee = adminFee.sub(adminFeePerInstallment.mul(n - 1));
+      fee = adminFee.sub(accumulatedFee);
     } else {
       principal = fixedPayment.sub(interest);
       payment = fixedPayment;
       fee = adminFeePerInstallment;
+      accumulatedFee = accumulatedFee.add(fee);
     }
 
     totalInterest = totalInterest.add(interest);
@@ -230,7 +250,7 @@ export function calculateFrenchSystem(input: AmortizationInput): AmortizationRes
   }
 
   const totalAmount = cashPrice.add(totalInterest).add(adminFee);
-  const { tna, tea, cft } = calculateRates(cashPrice.toNumber(), totalAmount.toNumber(), n);
+  const { tna, tea, cft } = calculateRates(cashPrice.toNumber(), installments, n);
 
   return {
     financedAmountCents: financedAmount.toNumber(),
@@ -250,11 +270,13 @@ export function calculateZeroInterest(input: AmortizationInput): AmortizationRes
   const adminFee = new Decimal(input.adminFeeCents);
   const n = input.numInstallments;
 
-  const installmentBase = cashPrice.div(n).toDecimalPlaces(0, Decimal.ROUND_HALF_UP);
-  const adminFeePerInstallment = adminFee.div(n).toDecimalPlaces(0, Decimal.ROUND_HALF_UP);
+  // Use ROUND_DOWN for per-installment values to avoid exceeding total
+  const installmentBase = cashPrice.div(n).toDecimalPlaces(0, Decimal.ROUND_DOWN);
+  const adminFeePerInstallment = adminFee.div(n).toDecimalPlaces(0, Decimal.ROUND_DOWN);
 
   const installments: InstallmentSchedule[] = [];
   let remainingBalance = cashPrice;
+  let accumulatedFee = new Decimal(0);
 
   for (let i = 1; i <= n; i++) {
     const isLast = i === n;
@@ -263,10 +285,11 @@ export function calculateZeroInterest(input: AmortizationInput): AmortizationRes
 
     if (isLast) {
       principal = remainingBalance;
-      fee = adminFee.sub(adminFeePerInstallment.mul(n - 1));
+      fee = adminFee.sub(accumulatedFee);
     } else {
       principal = installmentBase;
       fee = adminFeePerInstallment;
+      accumulatedFee = accumulatedFee.add(fee);
     }
 
     remainingBalance = remainingBalance.sub(principal);
@@ -283,7 +306,7 @@ export function calculateZeroInterest(input: AmortizationInput): AmortizationRes
   }
 
   const totalAmount = cashPrice.add(adminFee);
-  const { tna, tea, cft } = calculateRates(cashPrice.toNumber(), totalAmount.toNumber(), n);
+  const { tna, tea, cft } = calculateRates(cashPrice.toNumber(), installments, n);
 
   return {
     financedAmountCents: cashPrice.toNumber(),
@@ -298,29 +321,43 @@ export function calculateZeroInterest(input: AmortizationInput): AmortizationRes
   };
 }
 
+/**
+ * Calculate TNA, TEA, and CFT separately:
+ * - TEA: Based on cashflows WITHOUT admin fee (pure financing cost)
+ * - CFT: Based on real cashflows WITH admin fee (total cost to consumer per Ley 24.240)
+ */
 function calculateRates(
   principal: number,
-  total: number,
+  installments: InstallmentSchedule[],
   numPeriods: number
 ): { tna: number; tea: number; cft: number } {
   if (principal <= 0 || numPeriods <= 0) {
     return { tna: 0, tea: 0, cft: 0 };
   }
 
-  const totalCost = total - principal;
-  if (totalCost <= 0) {
+  // TEA: Calculate using payments WITHOUT admin fee (principal + interest only)
+  const paymentsWithoutFee = installments.map(inst => inst.principalCents + inst.interestCents);
+  const totalWithoutFee = paymentsWithoutFee.reduce((sum, p) => sum + p, 0);
+  
+  if (totalWithoutFee <= principal) {
     return { tna: 0, tea: 0, cft: 0 };
   }
 
-  const monthlyPayment = new Decimal(total).div(numPeriods);
-  const monthlyRate = findIRR(principal, monthlyPayment.toNumber(), numPeriods);
+  const teaMonthlyRate = findIRR(principal, paymentsWithoutFee);
+  const tna = new Decimal(teaMonthlyRate).mul(12);
+  const tea = new Decimal(1).add(teaMonthlyRate).pow(12).sub(1);
+
+  // CFT: Calculate using REAL payments WITH admin fee (total cost)
+  const paymentsWithFee = installments.map(inst => inst.totalCents);
+  const totalWithFee = paymentsWithFee.reduce((sum, p) => sum + p, 0);
   
-  const tna = new Decimal(monthlyRate).mul(12);
-  const tea = new Decimal(1).add(monthlyRate).pow(12).sub(1);
-  
-  const cftMonthlyPayment = new Decimal(total).div(numPeriods);
-  const cftMonthlyRate = findIRR(principal, cftMonthlyPayment.toNumber(), numPeriods);
-  const cft = new Decimal(1).add(cftMonthlyRate).pow(12).sub(1);
+  let cft: Decimal;
+  if (totalWithFee <= principal) {
+    cft = new Decimal(0);
+  } else {
+    const cftMonthlyRate = findIRR(principal, paymentsWithFee);
+    cft = new Decimal(1).add(cftMonthlyRate).pow(12).sub(1);
+  }
 
   return {
     tna: tna.mul(100).toDecimalPlaces(4).toNumber(),
@@ -329,36 +366,116 @@ function calculateRates(
   };
 }
 
-function findIRR(principal: number, payment: number, periods: number, guess = 0.01): number {
-  const maxIterations = 100;
+/**
+ * Find IRR using bisection method with Newton-Raphson refinement.
+ * Throws IRRConvergenceError if no convergence after max iterations.
+ * 
+ * @param principal - Initial loan amount (negative cashflow at t=0)
+ * @param payments - Array of payment amounts at each period
+ * @returns Monthly rate (not annualized)
+ */
+function findIRR(principal: number, payments: number[]): number {
+  const maxIterations = 200;
   const tolerance = 1e-10;
-  
-  let rate = new Decimal(guess);
-  
-  for (let i = 0; i < maxIterations; i++) {
-    let npv = new Decimal(-principal);
-    let dnpv = new Decimal(0);
-    
+  const periods = payments.length;
+
+  // NPV function for a given rate
+  const npv = (rate: Decimal): Decimal => {
+    let result = new Decimal(-principal);
     for (let t = 1; t <= periods; t++) {
       const discountFactor = rate.add(1).pow(-t);
-      npv = npv.add(new Decimal(payment).mul(discountFactor));
-      dnpv = dnpv.sub(new Decimal(payment).mul(t).mul(rate.add(1).pow(-t - 1)));
+      result = result.add(new Decimal(payments[t - 1]).mul(discountFactor));
+    }
+    return result;
+  };
+
+  // Derivative of NPV for Newton-Raphson
+  const dnpv = (rate: Decimal): Decimal => {
+    let result = new Decimal(0);
+    for (let t = 1; t <= periods; t++) {
+      result = result.sub(new Decimal(payments[t - 1]).mul(t).mul(rate.add(1).pow(-t - 1)));
+    }
+    return result;
+  };
+
+  // Phase 1: Bisection to find rough bounds
+  let lower = new Decimal(-0.99); // Allow negative rates (rare but possible)
+  let upper = new Decimal(10); // 1000% monthly (extreme upper bound, no artificial cap)
+  
+  let npvLower = npv(lower);
+  let npvUpper = npv(upper);
+  
+  // If both have same sign, expand search
+  let expansionAttempts = 0;
+  while (npvLower.mul(npvUpper).greaterThan(0) && expansionAttempts < 20) {
+    if (npvLower.greaterThan(0)) {
+      lower = lower.mul(2);
+    } else {
+      upper = upper.mul(2);
+    }
+    npvLower = npv(lower);
+    npvUpper = npv(upper);
+    expansionAttempts++;
+  }
+
+  if (npvLower.mul(npvUpper).greaterThan(0)) {
+    throw new IRRConvergenceError(
+      `IRR does not converge: no root found between ${lower.toNumber()} and ${upper.toNumber()}`
+    );
+  }
+
+  // Bisection iterations to narrow down
+  let mid = lower.add(upper).div(2);
+  for (let i = 0; i < 50; i++) {
+    mid = lower.add(upper).div(2);
+    const npvMid = npv(mid);
+    
+    if (npvMid.abs().lessThan(tolerance)) {
+      return mid.toNumber();
     }
     
-    if (dnpv.isZero()) break;
+    if (npvLower.mul(npvMid).lessThan(0)) {
+      upper = mid;
+      npvUpper = npvMid;
+    } else {
+      lower = mid;
+      npvLower = npvMid;
+    }
+  }
+
+  // Phase 2: Newton-Raphson refinement from bisection result
+  let rate = mid;
+  for (let i = 0; i < maxIterations; i++) {
+    const npvValue = npv(rate);
+    const dnpvValue = dnpv(rate);
     
-    const newRate = rate.sub(npv.div(dnpv));
+    if (npvValue.abs().lessThan(tolerance)) {
+      return rate.toNumber();
+    }
+    
+    if (dnpvValue.isZero()) {
+      break; // Derivative is zero, can't continue Newton
+    }
+    
+    const newRate = rate.sub(npvValue.div(dnpvValue));
     
     if (newRate.sub(rate).abs().lessThan(tolerance)) {
       return newRate.toNumber();
     }
     
-    rate = newRate;
-    if (rate.lessThan(0)) rate = new Decimal(0.0001);
-    if (rate.greaterThan(1)) rate = new Decimal(0.9999);
+    // Keep within reasonable bounds but don't cap at 0.9999
+    if (newRate.lessThan(-0.99)) {
+      rate = new Decimal(-0.99);
+    } else if (newRate.greaterThan(100)) {
+      rate = new Decimal(100);
+    } else {
+      rate = newRate;
+    }
   }
   
-  return rate.toNumber();
+  throw new IRRConvergenceError(
+    `IRR did not converge after ${maxIterations} iterations. Last rate: ${rate.toNumber()}`
+  );
 }
 
 export function calculateAmortization(input: AmortizationInput): AmortizationResult {
@@ -376,6 +493,18 @@ export function calculateAmortization(input: AmortizationInput): AmortizationRes
   }
 }
 
+/**
+ * Calculate penalty using ROUND_HALF_UP to centavo.
+ * Server (SQL) is the source of truth - this function mirrors the SQL logic.
+ * 
+ * @param outstandingCents - Outstanding amount in cents
+ * @param dueDate - Due date of the installment
+ * @param currentDate - Current date for calculation
+ * @param graceDays - Number of grace days before penalty starts
+ * @param dailyRate - Daily penalty rate (e.g., 0.001 for 0.1%)
+ * @param cap - Maximum penalty as fraction of outstanding (e.g., 0.30 for 30%)
+ * @returns Penalty amount in cents (ROUND_HALF_UP to integer)
+ */
 export function calculatePenalty(
   outstandingCents: number,
   dueDate: Date,
@@ -390,10 +519,65 @@ export function calculatePenalty(
 
   if (daysOverdue <= 0) return 0;
 
-  const penalty = new Decimal(outstandingCents).mul(dailyRate).mul(daysOverdue);
-  const maxPenalty = new Decimal(outstandingCents).mul(cap);
+  const outstanding = new Decimal(outstandingCents);
+  const penalty = outstanding.mul(dailyRate).mul(daysOverdue);
+  const maxPenalty = outstanding.mul(cap);
 
-  return Math.min(penalty.toNumber(), maxPenalty.toNumber());
+  // ROUND_HALF_UP to centavo (integer)
+  const finalPenalty = Decimal.min(penalty, maxPenalty).toDecimalPlaces(0, Decimal.ROUND_HALF_UP);
+
+  return finalPenalty.toNumber();
+}
+
+/**
+ * Payment allocation order for partial payments:
+ * 1. Penalty (punitorios)
+ * 2. Interest (intereses)
+ * 3. Admin fee (cargo administrativo)
+ * 4. Principal (capital)
+ * 
+ * Returns the allocation breakdown.
+ */
+export interface PaymentAllocation {
+  penaltyAppliedCents: number;
+  interestAppliedCents: number;
+  adminFeeAppliedCents: number;
+  principalAppliedCents: number;
+  remainingCents: number;
+}
+
+export function allocatePayment(
+  paymentCents: number,
+  outstandingPenaltyCents: number,
+  outstandingInterestCents: number,
+  outstandingAdminFeeCents: number,
+  outstandingPrincipalCents: number
+): PaymentAllocation {
+  let remaining = new Decimal(paymentCents);
+  
+  // 1. Penalty first
+  const penaltyApplied = Decimal.min(remaining, new Decimal(outstandingPenaltyCents));
+  remaining = remaining.sub(penaltyApplied);
+  
+  // 2. Interest
+  const interestApplied = Decimal.min(remaining, new Decimal(outstandingInterestCents));
+  remaining = remaining.sub(interestApplied);
+  
+  // 3. Admin fee
+  const adminFeeApplied = Decimal.min(remaining, new Decimal(outstandingAdminFeeCents));
+  remaining = remaining.sub(adminFeeApplied);
+  
+  // 4. Principal
+  const principalApplied = Decimal.min(remaining, new Decimal(outstandingPrincipalCents));
+  remaining = remaining.sub(principalApplied);
+
+  return {
+    penaltyAppliedCents: penaltyApplied.toDecimalPlaces(0, Decimal.ROUND_HALF_UP).toNumber(),
+    interestAppliedCents: interestApplied.toDecimalPlaces(0, Decimal.ROUND_HALF_UP).toNumber(),
+    adminFeeAppliedCents: adminFeeApplied.toDecimalPlaces(0, Decimal.ROUND_HALF_UP).toNumber(),
+    principalAppliedCents: principalApplied.toDecimalPlaces(0, Decimal.ROUND_HALF_UP).toNumber(),
+    remainingCents: remaining.toDecimalPlaces(0, Decimal.ROUND_HALF_UP).toNumber(),
+  };
 }
 
 export function formatCurrency(cents: number): string {
