@@ -66,9 +66,12 @@ export default function ClientsPage() {
     const { data: tenantUser } = await supabase
       .from('tenant_users')
       .select('tenant_id')
-      .single() as { data: { tenant_id: string } | null };
+      .maybeSingle() as { data: { tenant_id: string } | null };
 
-    if (!tenantUser) return;
+    if (!tenantUser) {
+      setIsLoading(false);
+      return;
+    }
 
     setTenantId(tenantUser.tenant_id);
 
@@ -146,18 +149,9 @@ export default function ClientsPage() {
         return;
       }
 
-      await supabase.from('audit_log').insert({
-        tenant_id: tenantId,
-        action: 'client_updated',
-        entity_type: 'client',
-        entity_id: editingClient.id,
-        old_data: editingClient as unknown,
-        new_data: clientData as unknown,
-      } as never);
-
       toast.success('Cliente actualizado');
     } else {
-      const { data: newClient, error } = await supabase
+      const { error } = await supabase
         .from('clients')
         .insert(clientData as never)
         .select()
@@ -171,14 +165,6 @@ export default function ClientsPage() {
         }
         return;
       }
-
-      await supabase.from('audit_log').insert({
-        tenant_id: tenantId,
-        action: 'client_created',
-        entity_type: 'client',
-        entity_id: newClient?.id,
-        new_data: newClient as unknown,
-      } as never);
 
       toast.success('Cliente creado');
     }

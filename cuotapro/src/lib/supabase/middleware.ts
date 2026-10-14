@@ -81,5 +81,20 @@ export async function updateSession(request: NextRequest) {
     return NextResponse.redirect(url);
   }
 
+  // For authenticated users on protected routes, check if they have a tenant
+  if (user && !isPublicRoute && !isTenantWebRoute && !isApiRoute && pathname !== '/onboarding') {
+    const { data: tenantUser } = await supabase
+      .from('tenant_users')
+      .select('tenant_id')
+      .eq('user_id', user.id)
+      .maybeSingle();
+
+    if (!tenantUser) {
+      const url = request.nextUrl.clone();
+      url.pathname = '/onboarding';
+      return NextResponse.redirect(url);
+    }
+  }
+
   return supabaseResponse;
 }

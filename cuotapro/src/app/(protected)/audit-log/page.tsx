@@ -46,9 +46,12 @@ export default function AuditLogPage() {
     const { data: tenantUser } = await supabase
       .from('tenant_users')
       .select('tenant_id')
-      .single() as { data: { tenant_id: string } | null };
+      .maybeSingle() as { data: { tenant_id: string } | null };
 
-    if (!tenantUser) return;
+    if (!tenantUser) {
+      setIsLoading(false);
+      return;
+    }
 
     const { count } = await supabase
       .from('audit_log')

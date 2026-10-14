@@ -55,9 +55,12 @@ export default function PlansPage() {
     const { data: tenantUser } = await supabase
       .from('tenant_users')
       .select('tenant_id')
-      .single() as { data: { tenant_id: string } | null };
+      .maybeSingle() as { data: { tenant_id: string } | null };
 
-    if (!tenantUser) return;
+    if (!tenantUser) {
+      setIsLoading(false);
+      return;
+    }
 
     let query = supabase
       .from('plans')
