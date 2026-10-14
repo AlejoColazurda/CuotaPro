@@ -42,7 +42,7 @@ function addMonths(date: Date, months: number): Date {
 }
 
 function getDueDate(startDate: Date, installmentNumber: number, paymentDay?: number): Date {
-  const date = addMonths(startDate, installmentNumber);
+  const date = addMonths(startDate, installmentNumber - 1);
   if (paymentDay && paymentDay >= 1 && paymentDay <= 28) {
     date.setDate(paymentDay);
   }
@@ -408,4 +408,17 @@ export function formatCurrency(cents: number): string {
 
 export function formatPercentage(value: number, decimals = 2): string {
   return `${value.toFixed(decimals)}%`;
+}
+
+export function parseLocalDate(dateString: string): Date {
+  if (!dateString) return new Date();
+  const [year, month, day] = dateString.split('-').map(Number);
+  return new Date(year, month - 1, day);
+}
+
+export function formatLocalDate(date: Date): string {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, '0');
+  const day = String(date.getDate()).padStart(2, '0');
+  return `${year}-${month}-${day}`;
 }

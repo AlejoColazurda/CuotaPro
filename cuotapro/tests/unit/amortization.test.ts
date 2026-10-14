@@ -7,6 +7,8 @@ import {
   calculateZeroInterest,
   calculatePenalty,
   formatCurrency,
+  parseLocalDate,
+  formatLocalDate,
 } from '@/lib/amortization/engine';
 import type { AmortizationInput } from '@/lib/amortization/engine';
 
@@ -292,6 +294,20 @@ describe('Amortization Engine', () => {
       }
     });
 
+    it('should have first installment due on start date (no off-by-one)', () => {
+      const startDate = new Date(2024, 10, 14);
+      const input: AmortizationInput = {
+        ...baseInput,
+        startDate,
+      };
+      
+      const result = calculateAmortization(input);
+      
+      expect(result.installments[0].dueDate.getFullYear()).toBe(2024);
+      expect(result.installments[0].dueDate.getMonth()).toBe(10);
+      expect(result.installments[0].dueDate.getDate()).toBe(14);
+    });
+
     it('should respect custom payment day', () => {
       const input: AmortizationInput = {
         ...baseInput,
@@ -303,6 +319,37 @@ describe('Amortization Engine', () => {
       result.installments.forEach((inst) => {
         expect(inst.dueDate.getDate()).toBe(15);
       });
+    });
+  });
+
+  describe('Local Date Utilities', () => {
+    it('parseLocalDate should parse YYYY-MM-DD as local date', () => {
+      const date = parseLocalDate('2024-11-14');
+      
+      expect(date.getFullYear()).toBe(2024);
+      expect(date.getMonth()).toBe(10);
+      expect(date.getDate()).toBe(14);
+    });
+
+    it('parseLocalDate should not shift date across timezone boundary', () => {
+      const date = parseLocalDate('2024-11-01');
+      
+      expect(date.getDate()).toBe(1);
+    });
+
+    it('formatLocalDate should format date as YYYY-MM-DD', () => {
+      const date = new Date(2024, 10, 14);
+      const formatted = formatLocalDate(date);
+      
+      expect(formatted).toBe('2024-11-14');
+    });
+
+    it('parseLocalDate roundtrip should preserve date', () => {
+      const original = '2024-11-14';
+      const date = parseLocalDate(original);
+      const roundtrip = formatLocalDate(date);
+      
+      expect(roundtrip).toBe(original);
     });
   });
 
