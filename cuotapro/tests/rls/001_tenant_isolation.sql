@@ -9,7 +9,7 @@ BEGIN;
 -- Load pgTAP extension
 CREATE EXTENSION IF NOT EXISTS pgtap;
 
-SELECT plan(26);
+SELECT plan(38);
 
 -- ============================================================================
 -- Setup: Create test users and data AS SUPERUSER (bypass RLS for setup)
@@ -383,9 +383,9 @@ SET LOCAL ROLE authenticated;
 
 SELECT throws_ok(
   $$SELECT public.activate_plan('eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee'::uuid)$$,
+  '42501',
   NULL,
-  NULL,
-  'Test 25: User 2 cannot activate User 1 plan (cross-tenant or wrong status)'
+  'Test 25: User 2 cannot activate User 1 plan (cross-tenant denied)'
 );
 
 SELECT throws_ok(
@@ -397,6 +397,174 @@ SELECT throws_ok(
   '42501',
   NULL,
   'Test 26: User 2 cannot register payment on User 1 plan (cross-tenant)'
+);
+
+RESET ROLE;
+
+-- ============================================================================
+-- Test 27-29: Partial and complete payments with plan completion
+-- ============================================================================
+
+-- Create a fresh active plan for payment tests
+INSERT INTO public.plans (id, tenant_id, client_id, description, cash_price_cents, financed_amount_cents, total_amount_cents, num_installments, interest_type, interest_rate, status)
+VALUES ('77777777-7777-7777-7777-777777777777', 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb', 'dddddddd-dddd-dddd-dddd-dddddddddddd', 'Plan Payment Test', 30000, 30000, 30000, 2, 'fixed_surcharge', 0, 'active')
+ON CONFLICT (id) DO NOTHING;
+
+-- Create two installments for this plan
+INSERT INTO public.installments (id, plan_id, number, due_date, principal_cents, interest_cents, total_cents, status, paid_cents)
+VALUES 
+  ('77770001-0000-0000-0000-000000000000', '77777777-7777-7777-7777-777777777777', 1, '2025-02-15', 15000, 0, 15000, 'pending', 0),
+  ('77770002-0000-0000-0000-000000000000', '77777777-7777-7777-7777-777777777777', 2, '2025-03-15', 15000, 0, 15000, 'pending', 0)
+ON CONFLICT (id) DO NOTHING;
+
+SELECT test_set_user('22222222-2222-2222-2222-222222222222');
+SET LOCAL ROLE authenticated;
+
+-- Test 27: Partial payment sets status to 'partial'
+SELECT lives_ok(
+  $$SELECT public.register_payment('77770001-0000-0000-0000-000000000000'::uuid, 5000::bigint, 0::bigint)$$,
+  'Test 27: Partial payment succeeds'
+);
+
+RESET ROLE;
+
+SELECT is(
+  (SELECT status::text FROM public.installments WHERE id = '77770001-0000-0000-0000-000000000000'),
+  'partial',
+  'Test 28: Partial payment sets installment status to partial'
+);
+
+-- Test 29: Complete payment sets status to 'paid'
+SELECT test_set_user('22222222-2222-2222-2222-222222222222');
+SET LOCAL ROLE authenticated;
+
+SELECT lives_ok(
+  $$SELECT public.register_payment('77770001-0000-0000-0000-000000000000'::uuid, 10000::bigint, 0::bigint)$$,
+  'Test 29: Complete payment on partial installment succeeds'
+);
+
+RESET ROLE;
+
+SELECT is(
+  (SELECT status::text FROM public.installments WHERE id = '77770001-0000-0000-0000-000000000000'),
+  'paid',
+  'Test 30: Full payment sets installment status to paid'
+);
+
+-- Test 31: Plan transitions to 'completed' when all installments are paid
+SELECT test_set_user('22222222-2222-2222-2222-222222222222');
+SET LOCAL ROLE authenticated;
+
+SELECT lives_ok(
+  $$SELECT public.register_payment('77770002-0000-0000-0000-000000000000'::uuid, 15000::bigint, 0::bigint)$$,
+  'Test 31: Payment on second installment succeeds'
+);
+
+RESET ROLE;
+
+SELECT is(
+  (SELECT status::text FROM public.plans WHERE id = '77777777-7777-7777-7777-777777777777'),
+  'completed',
+  'Test 32: Plan status transitions to completed when all installments paid'
+);
+
+-- ============================================================================
+-- Test 33-35: Trigger blocks direct changes to plans (authenticated cannot bypass)
+-- ============================================================================
+
+-- Create a fresh draft plan for trigger tests
+INSERT INTO public.plans (id, tenant_id, client_id, description, cash_price_cents, financed_amount_cents, total_amount_cents, num_installments, interest_type, interest_rate, status)
+VALUES ('88888888-8888-8888-8888-888888888888', 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb', 'dddddddd-dddd-dddd-dddd-dddddddddddd', 'Plan Trigger Test', 50000, 50000, 55000, 2, 'fixed_surcharge', 0.10, 'draft')
+ON CONFLICT (id) DO NOTHING;
+
+INSERT INTO public.installments (id, plan_id, number, due_date, principal_cents, interest_cents, total_cents, status, paid_cents)
+VALUES ('88880001-0000-0000-0000-000000000000', '88888888-8888-8888-8888-888888888888', 1, '2025-04-15', 27500, 2750, 30250, 'pending', 0)
+ON CONFLICT (id) DO NOTHING;
+
+SELECT test_set_user('22222222-2222-2222-2222-222222222222');
+SET LOCAL ROLE authenticated;
+
+-- Test 33: Trigger blocks direct status change on plans
+SELECT throws_ok(
+  $$UPDATE public.plans SET status = 'active' WHERE id = '88888888-8888-8888-8888-888888888888'$$,
+  '23514',
+  NULL,
+  'Test 33: Trigger blocks direct status change on plans'
+);
+
+-- Test 34: Trigger blocks direct total_amount_cents change on plans
+SELECT throws_ok(
+  $$UPDATE public.plans SET total_amount_cents = 999999 WHERE id = '88888888-8888-8888-8888-888888888888'$$,
+  '23514',
+  NULL,
+  'Test 34: Trigger blocks direct total_amount_cents change on plans'
+);
+
+-- Test 35: set_config exploit attempt fails (current_user check cannot be bypassed)
+SELECT throws_ok(
+  $$DO $exploit$
+    BEGIN
+      -- Attempt to bypass trigger by setting GUC (this should have no effect)
+      PERFORM set_config('rls.bypass_plan_check', 'true', true);
+      -- Try to change status directly
+      UPDATE public.plans SET status = 'active' WHERE id = '88888888-8888-8888-8888-888888888888';
+    END;
+  $exploit$$$,
+  '23514',
+  NULL,
+  'Test 35: set_config bypass exploit fails (current_user check is secure)'
+);
+
+RESET ROLE;
+
+-- ============================================================================
+-- Test 36-37: Trigger blocks direct changes to installments
+-- ============================================================================
+
+SELECT test_set_user('22222222-2222-2222-2222-222222222222');
+SET LOCAL ROLE authenticated;
+
+-- Test 36: Trigger blocks direct paid_cents change
+SELECT throws_ok(
+  $$UPDATE public.installments SET paid_cents = 10000 WHERE id = '88880001-0000-0000-0000-000000000000'$$,
+  '23514',
+  NULL,
+  'Test 36: Trigger blocks direct paid_cents change on installments'
+);
+
+-- Test 37: Trigger blocks direct status change on installments
+SELECT throws_ok(
+  $$UPDATE public.installments SET status = 'paid' WHERE id = '88880001-0000-0000-0000-000000000000'$$,
+  '23514',
+  NULL,
+  'Test 37: Trigger blocks direct status change on installments'
+);
+
+RESET ROLE;
+
+-- ============================================================================
+-- Test 38: Paid draft + activate_plan exploit blocked
+-- ============================================================================
+
+-- First, as superuser, create a draft plan with a "paid" installment (simulating exploit setup)
+-- This would require bypassing the normal flow, which the trigger should prevent
+INSERT INTO public.plans (id, tenant_id, client_id, description, cash_price_cents, financed_amount_cents, total_amount_cents, num_installments, interest_type, interest_rate, status)
+VALUES ('99999999-9999-9999-9999-999999999999', 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb', 'dddddddd-dddd-dddd-dddd-dddddddddddd', 'Plan Exploit Test', 10000, 10000, 10000, 1, 'fixed_surcharge', 0, 'draft')
+ON CONFLICT (id) DO UPDATE SET status = 'draft';
+
+INSERT INTO public.installments (id, plan_id, number, due_date, principal_cents, interest_cents, total_cents, status, paid_cents)
+VALUES ('99990001-0000-0000-0000-000000000000', '99999999-9999-9999-9999-999999999999', 1, '2025-05-15', 10000, 0, 10000, 'paid', 10000)
+ON CONFLICT (id) DO UPDATE SET status = 'paid', paid_cents = 10000;
+
+-- Now test: even if somehow a draft plan has paid installments, activate_plan should work
+-- (the plan status check is on the plan, not on installments)
+-- The real protection is the trigger preventing authenticated users from setting paid_cents/status directly
+SELECT test_set_user('22222222-2222-2222-2222-222222222222');
+SET LOCAL ROLE authenticated;
+
+SELECT lives_ok(
+  $$SELECT public.activate_plan('99999999-9999-9999-9999-999999999999'::uuid)$$,
+  'Test 38: activate_plan works on draft (exploit prevented at trigger level, not activate_plan)'
 );
 
 RESET ROLE;

@@ -1,5 +1,5 @@
 #!/bin/bash
-set -e
+set -euo pipefail
 
 # RLS Integration Test Runner
 # Runs pgTAP tests against a local Supabase instance
@@ -31,7 +31,7 @@ echo "Database URL: ${DB_URL%@*}@***"
 
 # Apply migrations
 echo "Applying migrations..."
-supabase db reset --debug 2>&1 | head -50
+supabase db reset --debug 2>&1
 
 # Run pgTAP tests
 echo "Running RLS tests..."
@@ -40,11 +40,18 @@ TEST_EXIT=0
 for test_file in tests/rls/*.sql; do
     echo ""
     echo "=== Running: $test_file ==="
-    if PGPASSWORD=postgres psql "$DB_URL" -f "$test_file" 2>&1; then
-        echo "✓ $test_file passed"
-    else
-        echo "✗ $test_file failed"
+    # Run with ON_ERROR_STOP=1 and capture output
+    OUTPUT=$(PGPASSWORD=postgres psql "$DB_URL" -v ON_ERROR_STOP=1 -f "$test_file" 2>&1) && EXIT_CODE=0 || EXIT_CODE=$?
+    echo "$OUTPUT"
+    
+    if [ $EXIT_CODE -ne 0 ]; then
+        echo "✗ $test_file failed with SQL error (exit code $EXIT_CODE)"
         TEST_EXIT=1
+    elif echo "$OUTPUT" | grep -qE '^\s*not ok'; then
+        echo "✗ $test_file has failing tests"
+        TEST_EXIT=1
+    else
+        echo "✓ $test_file passed"
     fi
 done
 

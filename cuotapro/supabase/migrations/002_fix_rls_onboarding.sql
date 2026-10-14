@@ -6,7 +6,7 @@
 --   - Prevent tenant hopping via UPDATE
 --   - Secure payment recording via RPC only
 --   - Audit log writes via RPC only
---   - Block status/total changes outside SECURITY DEFINER
+--   - Block status/total changes outside SECURITY DEFINER (via current_user check)
 
 -- ============================================================================
 -- EXTENSIONS (in extensions schema for security)
@@ -36,6 +36,9 @@ GRANT EXECUTE ON FUNCTION public.get_user_tenant_ids() TO authenticated;
 
 -- ============================================================================
 -- IMMUTABLE FIELD TRIGGERS (prevent tenant hopping)
+-- Uses current_user check: SECURITY DEFINER functions run as 'postgres',
+-- authenticated users run as 'authenticated' or 'anon'.
+-- This cannot be bypassed via set_config from an authenticated session.
 -- ============================================================================
 
 -- tenant_users: prevent changes to tenant_id and user_id
@@ -102,6 +105,7 @@ CREATE TRIGGER portfolios_immutable
   EXECUTE FUNCTION public.portfolios_immutable_check();
 
 -- plans: prevent changes to tenant_id, client_id, AND status/total outside SECURITY DEFINER
+-- Uses current_user check: SECURITY DEFINER runs as postgres, authenticated runs as authenticated
 CREATE OR REPLACE FUNCTION public.plans_immutable_check()
 RETURNS TRIGGER
 LANGUAGE plpgsql
@@ -114,8 +118,9 @@ BEGIN
   IF NEW.client_id IS DISTINCT FROM OLD.client_id THEN
     RAISE EXCEPTION 'Cannot change client_id' USING ERRCODE = '23514';
   END IF;
-  -- Block status/total_amount_cents changes unless called from SECURITY DEFINER (current_setting returns null in definer)
-  IF current_setting('rls.bypass_plan_check', true) IS DISTINCT FROM 'true' THEN
+  -- Block status/total_amount_cents changes unless called from SECURITY DEFINER
+  -- SECURITY DEFINER functions run as 'postgres', authenticated users run as 'authenticated'
+  IF current_user NOT IN ('postgres', 'supabase_admin') THEN
     IF NEW.status IS DISTINCT FROM OLD.status THEN
       RAISE EXCEPTION 'Cannot change plan status directly; use activate_plan/cancel_plan RPC' USING ERRCODE = '23514';
     END IF;
@@ -133,7 +138,7 @@ CREATE TRIGGER plans_immutable
   FOR EACH ROW
   EXECUTE FUNCTION public.plans_immutable_check();
 
--- installments: prevent changes to plan_id
+-- installments: prevent changes to plan_id AND paid_cents/status outside SECURITY DEFINER
 CREATE OR REPLACE FUNCTION public.installments_immutable_check()
 RETURNS TRIGGER
 LANGUAGE plpgsql
@@ -142,6 +147,15 @@ AS $$
 BEGIN
   IF NEW.plan_id IS DISTINCT FROM OLD.plan_id THEN
     RAISE EXCEPTION 'Cannot change plan_id' USING ERRCODE = '23514';
+  END IF;
+  -- Block paid_cents/status changes unless called from SECURITY DEFINER
+  IF current_user NOT IN ('postgres', 'supabase_admin') THEN
+    IF NEW.paid_cents IS DISTINCT FROM OLD.paid_cents THEN
+      RAISE EXCEPTION 'Cannot change paid_cents directly; use register_payment RPC' USING ERRCODE = '23514';
+    END IF;
+    IF NEW.status IS DISTINCT FROM OLD.status THEN
+      RAISE EXCEPTION 'Cannot change installment status directly; use register_payment RPC' USING ERRCODE = '23514';
+    END IF;
   END IF;
   RETURN NEW;
 END;
@@ -300,7 +314,6 @@ DECLARE
   v_suffix INTEGER := 2;
   v_lock_key BIGINT;
 BEGIN
-  -- Normalize: lowercase first, then remove accents, then clean
   v_base_slug := lower(trim(COALESCE(p_name, '')));
   v_base_slug := extensions.unaccent(v_base_slug);
   v_base_slug := regexp_replace(v_base_slug, '[^a-z0-9\s-]', '', 'g');
@@ -313,7 +326,6 @@ BEGIN
     v_base_slug := 'negocio';
   END IF;
   
-  -- Use advisory lock to prevent race conditions on slug generation
   v_lock_key := hashtext(v_base_slug);
   PERFORM pg_advisory_xact_lock(v_lock_key);
   
@@ -338,7 +350,6 @@ REVOKE ALL ON FUNCTION public.generate_unique_slug(TEXT) FROM authenticated;
 
 -- ============================================================================
 -- MAIN FUNCTION: Create tenant with owner (atomic, bypasses RLS)
--- Handles unique_violation with retry
 -- ============================================================================
 
 CREATE OR REPLACE FUNCTION public.create_tenant_with_owner(
@@ -371,7 +382,6 @@ BEGIN
     RAISE EXCEPTION 'User is already an owner of a tenant' USING ERRCODE = '23505';
   END IF;
   
-  -- Retry loop for slug uniqueness race condition
   LOOP
     v_slug := public.generate_unique_slug(p_name);
     
@@ -389,14 +399,13 @@ BEGIN
       INSERT INTO public.tenant_users (tenant_id, user_id, role)
       VALUES (v_tenant_id, v_user_id, 'owner');
       
-      EXIT; -- Success, exit loop
+      EXIT;
     EXCEPTION
       WHEN unique_violation THEN
         v_retries := v_retries + 1;
         IF v_retries > 5 THEN
           RAISE EXCEPTION 'Failed to generate unique slug after % retries', v_retries;
         END IF;
-        -- Continue loop to retry with new slug
     END;
   END LOOP;
   
@@ -413,7 +422,7 @@ GRANT EXECUTE ON FUNCTION public.create_tenant_with_owner(TEXT, TEXT) TO authent
 
 -- ============================================================================
 -- FUNCTION: Register payment (secure, with validation, locking, and audit)
--- Uses BIGINT for cents, proper enum type for status
+-- Runs as postgres (SECURITY DEFINER), so trigger allows paid_cents/status changes
 -- ============================================================================
 
 CREATE OR REPLACE FUNCTION public.register_payment(
@@ -460,7 +469,6 @@ BEGIN
     RAISE EXCEPTION 'Los punitorios no pueden ser negativos' USING ERRCODE = 'P0002';
   END IF;
   
-  -- Lock plan and installment rows to prevent concurrent modifications
   SELECT 
     i.plan_id,
     i.total_cents,
@@ -508,7 +516,6 @@ BEGIN
     v_new_status := 'partial'::public.payment_status;
   END IF;
   
-  -- Insert payment record (penalty_paid_cents stored in payment, NOT added to installment)
   INSERT INTO public.payments (
     tenant_id,
     plan_id,
@@ -531,7 +538,7 @@ BEGIN
     v_user_id
   ) RETURNING id INTO v_payment_id;
   
-  -- Update installment (paid_cents only, penalty tracked in payment record)
+  -- Update installment - trigger allows this because current_user = 'postgres'
   UPDATE public.installments
   SET 
     paid_cents = v_new_paid,
@@ -539,22 +546,18 @@ BEGIN
     updated_at = NOW()
   WHERE id = p_installment_id;
   
-  -- Check if all installments are paid
   SELECT NOT EXISTS (
     SELECT 1 FROM public.installments
     WHERE plan_id = v_plan_id AND status != 'paid'
   ) INTO v_all_paid;
   
-  -- Mark plan as completed if all paid (bypass trigger check)
+  -- Update plan status - trigger allows this because current_user = 'postgres'
   IF v_all_paid THEN
-    PERFORM set_config('rls.bypass_plan_check', 'true', true);
     UPDATE public.plans
     SET status = 'completed', updated_at = NOW()
     WHERE id = v_plan_id;
-    PERFORM set_config('rls.bypass_plan_check', '', true);
   END IF;
   
-  -- Write audit log
   INSERT INTO public.audit_log (
     tenant_id,
     user_id,
@@ -590,15 +593,7 @@ REVOKE ALL ON FUNCTION public.register_payment(UUID, BIGINT, BIGINT, TEXT, TEXT,
 GRANT EXECUTE ON FUNCTION public.register_payment(UUID, BIGINT, BIGINT, TEXT, TEXT, TEXT) TO authenticated;
 
 COMMENT ON FUNCTION public.register_payment(UUID, BIGINT, BIGINT, TEXT, TEXT, TEXT) IS 
-'Registra un pago para una cuota. Valida plan activo, tenant membership, y saldo.
-Argumentos:
-  p_installment_id: ID de la cuota
-  p_amount_cents: Monto del pago en centavos (BIGINT, > 0)
-  p_penalty_paid_cents: Punitorios pagados (BIGINT, default 0, registrado en payment)
-  p_method: Método de pago (opcional)
-  p_reference: Referencia/comprobante (opcional)
-  p_notes: Notas adicionales (opcional)
-Retorna JSON: { payment_id, installment_status, plan_completed }';
+'Registra un pago para una cuota. Valida plan activo, tenant membership, y saldo.';
 
 -- ============================================================================
 -- FUNCTION: Activate plan (secure, with audit)
@@ -636,12 +631,10 @@ BEGIN
     RAISE EXCEPTION 'Solo podés activar planes en borrador' USING ERRCODE = 'P0004';
   END IF;
   
-  -- Bypass trigger check for status change
-  PERFORM set_config('rls.bypass_plan_check', 'true', true);
+  -- Trigger allows this because current_user = 'postgres'
   UPDATE public.plans
   SET status = 'active', activated_at = NOW(), updated_at = NOW()
   WHERE id = p_plan_id;
-  PERFORM set_config('rls.bypass_plan_check', '', true);
   
   INSERT INTO public.audit_log (tenant_id, user_id, action, entity_type, entity_id)
   VALUES (v_tenant_id, v_user_id, 'plan_activated', 'plan', p_plan_id);
@@ -690,11 +683,9 @@ BEGIN
     RAISE EXCEPTION 'No podés cancelar un plan en estado %', v_status USING ERRCODE = 'P0004';
   END IF;
   
-  PERFORM set_config('rls.bypass_plan_check', 'true', true);
   UPDATE public.plans
   SET status = 'cancelled', cancelled_at = NOW(), updated_at = NOW()
   WHERE id = p_plan_id;
-  PERFORM set_config('rls.bypass_plan_check', '', true);
   
   INSERT INTO public.audit_log (tenant_id, user_id, action, entity_type, entity_id)
   VALUES (v_tenant_id, v_user_id, 'plan_cancelled', 'plan', p_plan_id);
@@ -779,11 +770,9 @@ BEGIN
     SELECT SUM(total_cents) INTO v_new_plan_total
     FROM public.installments WHERE plan_id = v_plan_id;
     
-    PERFORM set_config('rls.bypass_plan_check', 'true', true);
     UPDATE public.plans
     SET total_amount_cents = v_new_plan_total, updated_at = NOW()
     WHERE id = v_plan_id;
-    PERFORM set_config('rls.bypass_plan_check', '', true);
   END IF;
   
   INSERT INTO public.audit_log (tenant_id, user_id, action, entity_type, entity_id, old_data, new_data)
@@ -807,7 +796,6 @@ GRANT EXECUTE ON FUNCTION public.edit_installment(UUID, DATE, BIGINT) TO authent
 
 -- ============================================================================
 -- FIX RECURSIVE/BROKEN RLS POLICIES
--- Use DROP POLICY IF EXISTS before each CREATE for re-runnability
 -- ============================================================================
 
 DROP POLICY IF EXISTS "Owners can manage tenant members" ON public.tenant_users;
@@ -818,10 +806,6 @@ DROP POLICY IF EXISTS "Owners can view all tenant members" ON public.tenant_user
 DROP POLICY IF EXISTS "Owners can insert tenant members" ON public.tenant_users;
 DROP POLICY IF EXISTS "Owners can update tenant members" ON public.tenant_users;
 DROP POLICY IF EXISTS "Owners can delete tenant members" ON public.tenant_users;
-
--- ============================================================================
--- TENANT_USERS: Fix recursive policy
--- ============================================================================
 
 CREATE POLICY "Users can view own tenant membership"
   ON public.tenant_users FOR SELECT
@@ -851,19 +835,11 @@ CREATE POLICY "Owners can delete tenant members"
   ON public.tenant_users FOR DELETE
   USING (public.is_tenant_owner(tenant_id) AND user_id != auth.uid());
 
--- ============================================================================
--- TENANTS: Fix UPDATE policy
--- ============================================================================
-
 DROP POLICY IF EXISTS "Owners can update their tenants v2" ON public.tenants;
 CREATE POLICY "Owners can update their tenants v2"
   ON public.tenants FOR UPDATE
   USING (public.is_tenant_owner(id))
   WITH CHECK (public.is_tenant_owner(id));
-
--- ============================================================================
--- API_KEYS: Fix recursive policy
--- ============================================================================
 
 DROP POLICY IF EXISTS "Owners can manage API keys v2" ON public.api_keys;
 CREATE POLICY "Owners can manage API keys v2"
@@ -871,10 +847,7 @@ CREATE POLICY "Owners can manage API keys v2"
   USING (public.is_tenant_owner(tenant_id))
   WITH CHECK (public.is_tenant_owner(tenant_id));
 
--- ============================================================================
--- PORTFOLIOS: Ensure INSERT works
--- ============================================================================
-
+-- PORTFOLIOS
 DROP POLICY IF EXISTS "Users can manage portfolios" ON public.portfolios;
 DROP POLICY IF EXISTS "Members can insert portfolios" ON public.portfolios;
 DROP POLICY IF EXISTS "Members can update portfolios" ON public.portfolios;
@@ -893,10 +866,7 @@ CREATE POLICY "Owners can delete portfolios"
   ON public.portfolios FOR DELETE
   USING (public.is_tenant_owner(tenant_id));
 
--- ============================================================================
--- CLIENTS: Ensure INSERT works
--- ============================================================================
-
+-- CLIENTS
 DROP POLICY IF EXISTS "Users can manage clients" ON public.clients;
 DROP POLICY IF EXISTS "Members can insert clients" ON public.clients;
 DROP POLICY IF EXISTS "Members can update clients" ON public.clients;
@@ -915,10 +885,7 @@ CREATE POLICY "Owners can delete clients"
   ON public.clients FOR DELETE
   USING (public.is_tenant_owner(tenant_id));
 
--- ============================================================================
--- PLANS: INSERT and limited UPDATE (status/total blocked by trigger)
--- ============================================================================
-
+-- PLANS (status/total blocked by trigger, not policy)
 DROP POLICY IF EXISTS "Users can manage plans" ON public.plans;
 DROP POLICY IF EXISTS "Members can insert plans" ON public.plans;
 DROP POLICY IF EXISTS "Members can update plans" ON public.plans;
@@ -929,7 +896,6 @@ CREATE POLICY "Members can insert plans"
   ON public.plans FOR INSERT
   WITH CHECK (public.is_tenant_member(tenant_id));
 
--- Allow update only on draft plans for non-critical fields (status/total blocked by trigger)
 CREATE POLICY "Members can update draft plans"
   ON public.plans FOR UPDATE
   USING (public.is_tenant_member(tenant_id) AND status = 'draft')
@@ -939,17 +905,13 @@ CREATE POLICY "Members can delete draft plans"
   ON public.plans FOR DELETE
   USING (public.is_tenant_member(tenant_id) AND status = 'draft');
 
--- ============================================================================
--- INSTALLMENTS: INSERT requires draft plan, pending status, paid_cents=0
--- ============================================================================
-
+-- INSTALLMENTS (paid_cents/status blocked by trigger)
 DROP POLICY IF EXISTS "Users can insert installments" ON public.installments;
 DROP POLICY IF EXISTS "Users can manage draft installments" ON public.installments;
 DROP POLICY IF EXISTS "Members can insert installments" ON public.installments;
 DROP POLICY IF EXISTS "Members can update draft installments" ON public.installments;
 DROP POLICY IF EXISTS "Members can delete draft installments" ON public.installments;
 
--- INSERT: plan must be draft, new installment must be pending with paid_cents=0
 CREATE POLICY "Members can insert installments"
   ON public.installments FOR INSERT
   WITH CHECK (
@@ -963,6 +925,8 @@ CREATE POLICY "Members can insert installments"
     AND paid_cents = 0
   );
 
+-- UPDATE policy: USING allows selecting draft plan installments,
+-- WITH CHECK allows saving only if still pending/paid_cents=0 (trigger blocks actual changes anyway)
 CREATE POLICY "Members can update draft installments"
   ON public.installments FOR UPDATE
   USING (EXISTS (
@@ -971,12 +935,16 @@ CREATE POLICY "Members can update draft installments"
     AND public.is_tenant_member(public.plans.tenant_id)
     AND public.plans.status = 'draft'
   ))
-  WITH CHECK (EXISTS (
-    SELECT 1 FROM public.plans
-    WHERE public.plans.id = installments.plan_id
-    AND public.is_tenant_member(public.plans.tenant_id)
-    AND public.plans.status = 'draft'
-  ));
+  WITH CHECK (
+    EXISTS (
+      SELECT 1 FROM public.plans
+      WHERE public.plans.id = installments.plan_id
+      AND public.is_tenant_member(public.plans.tenant_id)
+      AND public.plans.status = 'draft'
+    )
+    AND status = 'pending'
+    AND paid_cents = 0
+  );
 
 CREATE POLICY "Members can delete draft installments"
   ON public.installments FOR DELETE
@@ -987,24 +955,15 @@ CREATE POLICY "Members can delete draft installments"
     AND public.plans.status = 'draft'
   ));
 
--- ============================================================================
--- PAYMENTS: No direct INSERT/UPDATE/DELETE - only via register_payment RPC
--- ============================================================================
-
+-- PAYMENTS: No direct INSERT/UPDATE/DELETE
 DROP POLICY IF EXISTS "Users can insert payments" ON public.payments;
 DROP POLICY IF EXISTS "Members can insert payments" ON public.payments;
 
--- ============================================================================
--- AUDIT_LOG: Remove client INSERT policy
--- ============================================================================
-
+-- AUDIT_LOG
 DROP POLICY IF EXISTS "System can insert audit log" ON public.audit_log;
 DROP POLICY IF EXISTS "Authenticated users can insert audit log" ON public.audit_log;
 
--- ============================================================================
--- PASSKEYS: Explicit per-operation policies
--- ============================================================================
-
+-- PASSKEYS
 DROP POLICY IF EXISTS "Users can manage own passkeys" ON public.passkeys;
 DROP POLICY IF EXISTS "Users can select own passkeys" ON public.passkeys;
 DROP POLICY IF EXISTS "Users can insert own passkeys" ON public.passkeys;
@@ -1028,10 +987,7 @@ CREATE POLICY "Users can delete own passkeys"
   ON public.passkeys FOR DELETE
   USING (user_id = auth.uid());
 
--- ============================================================================
--- SESSIONS: Explicit per-operation policies
--- ============================================================================
-
+-- SESSIONS
 DROP POLICY IF EXISTS "Users can manage own sessions" ON public.sessions;
 DROP POLICY IF EXISTS "Users can select own sessions" ON public.sessions;
 DROP POLICY IF EXISTS "Users can insert own sessions" ON public.sessions;
@@ -1060,11 +1016,4 @@ CREATE POLICY "Users can delete own sessions"
 -- ============================================================================
 
 COMMENT ON FUNCTION public.create_tenant_with_owner(TEXT, TEXT) IS 
-'Creates a new tenant and assigns the current user as owner.
-Arguments:
-  p_name: Business name (used to generate slug)
-  p_full_name: User''s full name (updates user_profiles)
-Returns JSON: { tenant_id: uuid, slug: text }
-Errors:
-  P0001: Not authenticated or email not found
-  23505: User is already an owner of a tenant';
+'Creates a new tenant and assigns the current user as owner.';

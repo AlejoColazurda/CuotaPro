@@ -115,8 +115,8 @@ jobs:
             
             echo "$OUTPUT"
             
-            # Check for 'not ok' in output (failed tests)
-            if echo "$OUTPUT" | grep -q '^not ok'; then
+            # Check for 'not ok' in output (failed tests) - use -E for extended regex to match leading whitespace
+            if echo "$OUTPUT" | grep -qE '^\s*not ok'; then
               echo "ERROR: Found failing tests in $test_file"
               FAILED=1
             fi
