@@ -246,6 +246,33 @@ El CFT se calcula usando TIR (Tasa Interna de Retorno) para cumplir con Ley 24.2
 - Audit log de todas las acciones sensibles
 - Passkeys como alternativa segura a contraseñas
 
+### Protección de Campos Críticos (Triggers)
+
+Los campos `status` (plans/installments), `paid_cents` y `total_amount_cents` están protegidos por triggers que verifican `current_user`:
+
+```sql
+IF current_user NOT IN ('postgres', 'supabase_admin') THEN
+  RAISE EXCEPTION 'Cannot change status directly; use RPC';
+END IF;
+```
+
+**Roles bloqueados:**
+- `authenticated` - usuarios autenticados via API
+- `anon` - usuarios anónimos
+- `service_role` - llamadas server-side con service key
+
+**Roles permitidos:**
+- `postgres` - conexión directa a la base
+- `supabase_admin` - funciones SECURITY DEFINER
+
+> **Importante:** Ni siquiera `service_role` puede modificar `status`, `paid_cents` o `total_amount_cents` directamente. Todas las modificaciones DEBEN hacerse a través de las RPCs:
+> - `register_payment()` - para pagos
+> - `activate_plan()` - para activar planes
+> - `cancel_plan()` - para cancelar planes
+> - `edit_installment()` - para editar cuotas (solo en draft)
+
+Esta restricción es intencional: garantiza que toda modificación de estado pase por la lógica de negocio validada en las funciones SECURITY DEFINER.
+
 ## Licencia
 
 Propietario - POTENCIAPP

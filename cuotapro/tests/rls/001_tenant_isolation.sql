@@ -9,7 +9,7 @@ BEGIN;
 -- Load pgTAP extension
 CREATE EXTENSION IF NOT EXISTS pgtap;
 
-SELECT plan(38);
+SELECT plan(44);
 
 -- ============================================================================
 -- Setup: Create test users and data AS SUPERUSER (bypass RLS for setup)
@@ -500,11 +500,16 @@ SELECT throws_ok(
   'Test 34: Trigger blocks direct total_amount_cents change on plans'
 );
 
--- Test 35: set_config exploit attempt fails (current_user check cannot be bypassed)
--- First attempt to set a GUC that old trigger might have used, then try to bypass
--- Note: set_config runs in the same session but current_user cannot be changed by set_config
+-- Test 35: REGRESSION TEST - GUC bypass exploit (CVE-like vulnerability)
+-- Background: An earlier implementation used set_config('rls.bypass_plan_check', 'true')
+-- to allow SECURITY DEFINER functions to modify status. An attacker could call
+-- set_config from an authenticated session to bypass the trigger.
+-- Fix: Replaced GUC check with current_user check. SECURITY DEFINER runs as 'postgres',
+-- authenticated sessions run as 'authenticated'. current_user CANNOT be spoofed via set_config.
+-- This test ensures the vulnerability does not regress.
 DO $$
 BEGIN
+  -- Attacker attempts to set the old GUC that would have bypassed the trigger
   PERFORM set_config('rls.bypass_plan_check', 'true', true);
 END;
 $$;
@@ -513,7 +518,7 @@ SELECT throws_ok(
   $$UPDATE public.plans SET status = 'active' WHERE id = '88888888-8888-8888-8888-888888888888'$$,
   '23514',
   NULL,
-  'Test 35: set_config bypass exploit fails (current_user check is secure)'
+  'Test 35: REGRESSION - GUC bypass exploit blocked (current_user check is immune to set_config)'
 );
 
 RESET ROLE;
@@ -544,28 +549,99 @@ SELECT throws_ok(
 RESET ROLE;
 
 -- ============================================================================
--- Test 38: Paid draft + activate_plan exploit blocked
+-- Test 38: Authenticated user blocked from UPDATE paid_cents/status on installments
 -- ============================================================================
 
--- First, as superuser, create a draft plan with a "paid" installment (simulating exploit setup)
--- This would require bypassing the normal flow, which the trigger should prevent
-INSERT INTO public.plans (id, tenant_id, client_id, description, cash_price_cents, financed_amount_cents, total_amount_cents, num_installments, interest_type, interest_rate, status)
-VALUES ('99999999-9999-9999-9999-999999999999', 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb', 'dddddddd-dddd-dddd-dddd-dddddddddddd', 'Plan Exploit Test', 10000, 10000, 10000, 1, 'fixed_surcharge', 0, 'draft')
-ON CONFLICT (id) DO UPDATE SET status = 'draft';
-
-INSERT INTO public.installments (id, plan_id, number, due_date, principal_cents, interest_cents, total_cents, status, paid_cents)
-VALUES ('99990001-0000-0000-0000-000000000000', '99999999-9999-9999-9999-999999999999', 1, '2025-05-15', 10000, 0, 10000, 'paid', 10000)
-ON CONFLICT (id) DO UPDATE SET status = 'paid', paid_cents = 10000;
-
--- Now test: even if somehow a draft plan has paid installments, activate_plan should work
--- (the plan status check is on the plan, not on installments)
--- The real protection is the trigger preventing authenticated users from setting paid_cents/status directly
+-- Test 38: Authenticated UPDATE of paid_cents blocked by trigger (same as Test 36 but explicit)
 SELECT test_set_user('22222222-2222-2222-2222-222222222222');
 SET LOCAL ROLE authenticated;
 
-SELECT lives_ok(
-  $$SELECT public.activate_plan('99999999-9999-9999-9999-999999999999'::uuid)$$,
-  'Test 38: activate_plan works on draft (exploit prevented at trigger level, not activate_plan)'
+SELECT throws_ok(
+  $$UPDATE public.installments SET paid_cents = 5000, status = 'partial' WHERE id = '88880001-0000-0000-0000-000000000000'$$,
+  '23514',
+  NULL,
+  'Test 38: Authenticated UPDATE of paid_cents AND status blocked by trigger (23514)'
+);
+
+RESET ROLE;
+
+-- ============================================================================
+-- Test 39-40: INSERT of installments restricted by RLS policy
+-- ============================================================================
+
+-- Test 39: INSERT on active plan blocked (RLS: plan must be draft)
+SELECT test_set_user('22222222-2222-2222-2222-222222222222');
+SET LOCAL ROLE authenticated;
+
+-- Plan ffffffff is active, so INSERT should be denied by RLS
+SELECT throws_ok(
+  $$INSERT INTO public.installments (plan_id, number, due_date, principal_cents, interest_cents, total_cents, status, paid_cents)
+    VALUES ('ffffffff-ffff-ffff-ffff-ffffffffffff', 99, '2025-12-01', 10000, 0, 10000, 'pending', 0)$$,
+  '42501',
+  NULL,
+  'Test 39: INSERT installment on active plan blocked by RLS (42501)'
+);
+
+-- Test 40: INSERT with paid_cents > 0 blocked (RLS: paid_cents must be 0)
+-- Plan 88888888 is draft, but trying to insert with paid_cents > 0
+SELECT throws_ok(
+  $$INSERT INTO public.installments (plan_id, number, due_date, principal_cents, interest_cents, total_cents, status, paid_cents)
+    VALUES ('88888888-8888-8888-8888-888888888888', 99, '2025-12-01', 10000, 0, 10000, 'pending', 5000)$$,
+  '42501',
+  NULL,
+  'Test 40: INSERT installment with paid_cents > 0 blocked by RLS (42501)'
+);
+
+RESET ROLE;
+
+-- ============================================================================
+-- Test 41-42: INSERT with invalid status blocked by RLS
+-- ============================================================================
+
+SELECT test_set_user('22222222-2222-2222-2222-222222222222');
+SET LOCAL ROLE authenticated;
+
+-- Test 41: INSERT with status != 'pending' blocked
+SELECT throws_ok(
+  $$INSERT INTO public.installments (plan_id, number, due_date, principal_cents, interest_cents, total_cents, status, paid_cents)
+    VALUES ('88888888-8888-8888-8888-888888888888', 98, '2025-12-01', 10000, 0, 10000, 'paid', 0)$$,
+  '42501',
+  NULL,
+  'Test 41: INSERT installment with status=paid blocked by RLS (42501)'
+);
+
+RESET ROLE;
+
+-- ============================================================================
+-- Test 42-44: service_role blocked by trigger (not in postgres/supabase_admin)
+-- ============================================================================
+
+-- Test 42: service_role UPDATE of plan status blocked by trigger
+-- service_role can bypass RLS but NOT triggers that check current_user
+RESET ROLE;
+SET LOCAL ROLE service_role;
+
+SELECT throws_ok(
+  $$UPDATE public.plans SET status = 'active' WHERE id = '88888888-8888-8888-8888-888888888888'$$,
+  '23514',
+  NULL,
+  'Test 42: service_role UPDATE of plan status blocked by trigger (23514)'
+);
+
+-- Test 43: service_role UPDATE of installment paid_cents blocked by trigger
+SELECT throws_ok(
+  $$UPDATE public.installments SET paid_cents = 5000 WHERE id = '88880001-0000-0000-0000-000000000000'$$,
+  '23514',
+  NULL,
+  'Test 43: service_role UPDATE of installment paid_cents blocked by trigger (23514)'
+);
+
+-- Test 44: service_role UPDATE of installment status blocked by trigger
+SELECT throws_ok(
+  $$UPDATE public.installments SET status = 'paid' WHERE id = '88880001-0000-0000-0000-000000000000'$$,
+  '23514',
+  NULL,
+  'Test 44: service_role UPDATE of installment status blocked by trigger (23514)'
 );
 
 RESET ROLE;
