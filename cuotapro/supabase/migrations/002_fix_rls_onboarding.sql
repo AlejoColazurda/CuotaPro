@@ -4,6 +4,8 @@
 --   - Recursive policy on tenant_users (42P17)
 --   - First owner cannot insert into tenant_users
 --   - Prevent tenant hopping via UPDATE
+--   - Secure payment recording via RPC only
+--   - Audit log writes via RPC only
 
 -- ============================================================================
 -- EXTENSIONS (in extensions schema for security)
@@ -14,17 +16,6 @@ CREATE EXTENSION IF NOT EXISTS unaccent WITH SCHEMA extensions;
 -- ============================================================================
 -- IMMUTABLE FIELD TRIGGERS (prevent tenant hopping)
 -- ============================================================================
-
--- Generic function to prevent changes to immutable columns
-CREATE OR REPLACE FUNCTION public.prevent_immutable_change()
-RETURNS TRIGGER
-LANGUAGE plpgsql
-SET search_path = ''
-AS $$
-BEGIN
-  RAISE EXCEPTION 'Cannot modify immutable field(s)' USING ERRCODE = '23514';
-END;
-$$;
 
 -- tenant_users: prevent changes to tenant_id and user_id
 CREATE OR REPLACE FUNCTION public.tenant_users_immutable_check()
@@ -388,6 +379,411 @@ REVOKE ALL ON FUNCTION public.create_tenant_with_owner(TEXT, TEXT) FROM anon;
 GRANT EXECUTE ON FUNCTION public.create_tenant_with_owner(TEXT, TEXT) TO authenticated;
 
 -- ============================================================================
+-- FUNCTION: Register payment (secure, with validation and audit)
+-- ============================================================================
+
+CREATE OR REPLACE FUNCTION public.register_payment(
+  p_installment_id UUID,
+  p_amount_cents INTEGER,
+  p_penalty_paid_cents INTEGER DEFAULT 0,
+  p_method TEXT DEFAULT NULL,
+  p_reference TEXT DEFAULT NULL,
+  p_notes TEXT DEFAULT NULL
+)
+RETURNS JSON
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = ''
+AS $$
+DECLARE
+  v_user_id UUID;
+  v_plan_id UUID;
+  v_tenant_id UUID;
+  v_plan_status TEXT;
+  v_installment_total INTEGER;
+  v_installment_paid INTEGER;
+  v_installment_number INTEGER;
+  v_outstanding INTEGER;
+  v_new_paid INTEGER;
+  v_new_status TEXT;
+  v_payment_id UUID;
+  v_all_paid BOOLEAN;
+BEGIN
+  -- Get current user
+  v_user_id := auth.uid();
+  IF v_user_id IS NULL THEN
+    RAISE EXCEPTION 'No autenticado' USING ERRCODE = 'P0001';
+  END IF;
+  
+  -- Validate input
+  IF p_amount_cents IS NULL OR p_amount_cents <= 0 THEN
+    RAISE EXCEPTION 'El monto debe ser mayor a cero' USING ERRCODE = 'P0002';
+  END IF;
+  
+  IF p_penalty_paid_cents IS NULL THEN
+    p_penalty_paid_cents := 0;
+  END IF;
+  
+  IF p_penalty_paid_cents < 0 THEN
+    RAISE EXCEPTION 'Los punitorios no pueden ser negativos' USING ERRCODE = 'P0002';
+  END IF;
+  
+  -- Get installment and plan info
+  SELECT 
+    i.plan_id,
+    i.total_cents,
+    i.paid_cents,
+    i.number,
+    p.tenant_id,
+    p.status
+  INTO 
+    v_plan_id,
+    v_installment_total,
+    v_installment_paid,
+    v_installment_number,
+    v_tenant_id,
+    v_plan_status
+  FROM public.installments i
+  JOIN public.plans p ON p.id = i.plan_id
+  WHERE i.id = p_installment_id;
+  
+  IF v_plan_id IS NULL THEN
+    RAISE EXCEPTION 'Cuota no encontrada' USING ERRCODE = 'P0003';
+  END IF;
+  
+  -- Check tenant membership
+  IF NOT public.is_tenant_member(v_tenant_id) THEN
+    RAISE EXCEPTION 'No tenés acceso a este plan' USING ERRCODE = '42501';
+  END IF;
+  
+  -- Check plan is active
+  IF v_plan_status != 'active' THEN
+    RAISE EXCEPTION 'Solo podés registrar pagos en planes activos' USING ERRCODE = 'P0004';
+  END IF;
+  
+  -- Calculate outstanding and check for overpayment
+  v_outstanding := v_installment_total - v_installment_paid;
+  
+  IF p_amount_cents > v_outstanding THEN
+    RAISE EXCEPTION 'El pago de $% excede el saldo pendiente de $%', 
+      (p_amount_cents / 100.0)::numeric(12,2),
+      (v_outstanding / 100.0)::numeric(12,2)
+    USING ERRCODE = 'P0005';
+  END IF;
+  
+  -- Calculate new paid amount and status
+  v_new_paid := v_installment_paid + p_amount_cents;
+  IF v_new_paid >= v_installment_total THEN
+    v_new_status := 'paid';
+  ELSE
+    v_new_status := 'partial';
+  END IF;
+  
+  -- Insert payment record
+  INSERT INTO public.payments (
+    tenant_id,
+    plan_id,
+    installment_id,
+    amount_cents,
+    penalty_paid_cents,
+    payment_method,
+    reference,
+    notes,
+    recorded_by
+  ) VALUES (
+    v_tenant_id,
+    v_plan_id,
+    p_installment_id,
+    p_amount_cents,
+    p_penalty_paid_cents,
+    p_method,
+    p_reference,
+    p_notes,
+    v_user_id
+  ) RETURNING id INTO v_payment_id;
+  
+  -- Update installment
+  UPDATE public.installments
+  SET 
+    paid_cents = v_new_paid,
+    penalty_cents = penalty_cents + p_penalty_paid_cents,
+    status = v_new_status,
+    updated_at = NOW()
+  WHERE id = p_installment_id;
+  
+  -- Check if all installments are paid
+  SELECT NOT EXISTS (
+    SELECT 1 FROM public.installments
+    WHERE plan_id = v_plan_id AND status != 'paid'
+  ) INTO v_all_paid;
+  
+  -- Mark plan as completed if all paid
+  IF v_all_paid THEN
+    UPDATE public.plans
+    SET status = 'completed', updated_at = NOW()
+    WHERE id = v_plan_id;
+  END IF;
+  
+  -- Write audit log
+  INSERT INTO public.audit_log (
+    tenant_id,
+    user_id,
+    action,
+    entity_type,
+    entity_id,
+    new_data
+  ) VALUES (
+    v_tenant_id,
+    v_user_id,
+    'payment_recorded',
+    'payment',
+    v_payment_id,
+    json_build_object(
+      'installment_number', v_installment_number,
+      'amount_cents', p_amount_cents,
+      'penalty_paid_cents', p_penalty_paid_cents,
+      'method', p_method,
+      'plan_completed', v_all_paid
+    )
+  );
+  
+  -- Return result
+  RETURN json_build_object(
+    'payment_id', v_payment_id,
+    'installment_status', v_new_status,
+    'plan_completed', v_all_paid
+  );
+END;
+$$;
+
+REVOKE ALL ON FUNCTION public.register_payment(UUID, INTEGER, INTEGER, TEXT, TEXT, TEXT) FROM PUBLIC;
+REVOKE ALL ON FUNCTION public.register_payment(UUID, INTEGER, INTEGER, TEXT, TEXT, TEXT) FROM anon;
+GRANT EXECUTE ON FUNCTION public.register_payment(UUID, INTEGER, INTEGER, TEXT, TEXT, TEXT) TO authenticated;
+
+COMMENT ON FUNCTION public.register_payment(UUID, INTEGER, INTEGER, TEXT, TEXT, TEXT) IS 
+'Registra un pago para una cuota. Valida que el plan esté activo, el usuario sea miembro del tenant, y no se exceda el saldo pendiente.
+Argumentos:
+  p_installment_id: ID de la cuota
+  p_amount_cents: Monto del pago en centavos (requerido, > 0)
+  p_penalty_paid_cents: Punitorios pagados en centavos (opcional, default 0)
+  p_method: Método de pago (payment_method column, opcional)
+  p_reference: Referencia/comprobante (opcional)
+  p_notes: Notas adicionales (opcional)
+Retorna JSON: { payment_id, installment_status, plan_completed }
+Errores:
+  P0001: No autenticado
+  P0002: Parámetros inválidos
+  P0003: Cuota no encontrada
+  P0004: Plan no activo
+  P0005: Sobrepago
+  42501: Sin acceso al tenant';
+
+-- ============================================================================
+-- FUNCTION: Activate plan (secure, with audit)
+-- ============================================================================
+
+CREATE OR REPLACE FUNCTION public.activate_plan(p_plan_id UUID)
+RETURNS JSON
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = ''
+AS $$
+DECLARE
+  v_user_id UUID;
+  v_tenant_id UUID;
+  v_status TEXT;
+BEGIN
+  v_user_id := auth.uid();
+  IF v_user_id IS NULL THEN
+    RAISE EXCEPTION 'No autenticado' USING ERRCODE = 'P0001';
+  END IF;
+  
+  -- Get plan info
+  SELECT tenant_id, status INTO v_tenant_id, v_status
+  FROM public.plans WHERE id = p_plan_id;
+  
+  IF v_tenant_id IS NULL THEN
+    RAISE EXCEPTION 'Plan no encontrado' USING ERRCODE = 'P0003';
+  END IF;
+  
+  IF NOT public.is_tenant_member(v_tenant_id) THEN
+    RAISE EXCEPTION 'No tenés acceso a este plan' USING ERRCODE = '42501';
+  END IF;
+  
+  IF v_status != 'draft' THEN
+    RAISE EXCEPTION 'Solo podés activar planes en borrador' USING ERRCODE = 'P0004';
+  END IF;
+  
+  -- Activate plan
+  UPDATE public.plans
+  SET status = 'active', activated_at = NOW(), updated_at = NOW()
+  WHERE id = p_plan_id;
+  
+  -- Audit log
+  INSERT INTO public.audit_log (tenant_id, user_id, action, entity_type, entity_id)
+  VALUES (v_tenant_id, v_user_id, 'plan_activated', 'plan', p_plan_id);
+  
+  RETURN json_build_object('success', true);
+END;
+$$;
+
+REVOKE ALL ON FUNCTION public.activate_plan(UUID) FROM PUBLIC;
+REVOKE ALL ON FUNCTION public.activate_plan(UUID) FROM anon;
+GRANT EXECUTE ON FUNCTION public.activate_plan(UUID) TO authenticated;
+
+-- ============================================================================
+-- FUNCTION: Cancel plan (secure, with audit)
+-- ============================================================================
+
+CREATE OR REPLACE FUNCTION public.cancel_plan(p_plan_id UUID)
+RETURNS JSON
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = ''
+AS $$
+DECLARE
+  v_user_id UUID;
+  v_tenant_id UUID;
+  v_status TEXT;
+BEGIN
+  v_user_id := auth.uid();
+  IF v_user_id IS NULL THEN
+    RAISE EXCEPTION 'No autenticado' USING ERRCODE = 'P0001';
+  END IF;
+  
+  SELECT tenant_id, status INTO v_tenant_id, v_status
+  FROM public.plans WHERE id = p_plan_id;
+  
+  IF v_tenant_id IS NULL THEN
+    RAISE EXCEPTION 'Plan no encontrado' USING ERRCODE = 'P0003';
+  END IF;
+  
+  IF NOT public.is_tenant_member(v_tenant_id) THEN
+    RAISE EXCEPTION 'No tenés acceso a este plan' USING ERRCODE = '42501';
+  END IF;
+  
+  IF v_status NOT IN ('draft', 'active') THEN
+    RAISE EXCEPTION 'No podés cancelar un plan en estado %', v_status USING ERRCODE = 'P0004';
+  END IF;
+  
+  -- Cancel plan
+  UPDATE public.plans
+  SET status = 'cancelled', cancelled_at = NOW(), updated_at = NOW()
+  WHERE id = p_plan_id;
+  
+  -- Audit log
+  INSERT INTO public.audit_log (tenant_id, user_id, action, entity_type, entity_id)
+  VALUES (v_tenant_id, v_user_id, 'plan_cancelled', 'plan', p_plan_id);
+  
+  RETURN json_build_object('success', true);
+END;
+$$;
+
+REVOKE ALL ON FUNCTION public.cancel_plan(UUID) FROM PUBLIC;
+REVOKE ALL ON FUNCTION public.cancel_plan(UUID) FROM anon;
+GRANT EXECUTE ON FUNCTION public.cancel_plan(UUID) TO authenticated;
+
+-- ============================================================================
+-- FUNCTION: Edit installment (only draft plans, with audit)
+-- ============================================================================
+
+CREATE OR REPLACE FUNCTION public.edit_installment(
+  p_installment_id UUID,
+  p_due_date DATE DEFAULT NULL,
+  p_total_cents INTEGER DEFAULT NULL
+)
+RETURNS JSON
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = ''
+AS $$
+DECLARE
+  v_user_id UUID;
+  v_tenant_id UUID;
+  v_plan_id UUID;
+  v_plan_status TEXT;
+  v_old_due_date DATE;
+  v_old_total_cents INTEGER;
+  v_new_plan_total INTEGER;
+BEGIN
+  v_user_id := auth.uid();
+  IF v_user_id IS NULL THEN
+    RAISE EXCEPTION 'No autenticado' USING ERRCODE = 'P0001';
+  END IF;
+  
+  -- Get installment and plan info
+  SELECT 
+    i.plan_id,
+    i.due_date,
+    i.total_cents,
+    p.tenant_id,
+    p.status
+  INTO 
+    v_plan_id,
+    v_old_due_date,
+    v_old_total_cents,
+    v_tenant_id,
+    v_plan_status
+  FROM public.installments i
+  JOIN public.plans p ON p.id = i.plan_id
+  WHERE i.id = p_installment_id;
+  
+  IF v_plan_id IS NULL THEN
+    RAISE EXCEPTION 'Cuota no encontrada' USING ERRCODE = 'P0003';
+  END IF;
+  
+  IF NOT public.is_tenant_member(v_tenant_id) THEN
+    RAISE EXCEPTION 'No tenés acceso a este plan' USING ERRCODE = '42501';
+  END IF;
+  
+  IF v_plan_status != 'draft' THEN
+    RAISE EXCEPTION 'Solo podés editar cuotas de planes en borrador' USING ERRCODE = 'P0004';
+  END IF;
+  
+  -- Validate
+  IF p_total_cents IS NOT NULL AND p_total_cents <= 0 THEN
+    RAISE EXCEPTION 'El monto debe ser mayor a cero' USING ERRCODE = 'P0002';
+  END IF;
+  
+  -- Update installment
+  UPDATE public.installments
+  SET 
+    due_date = COALESCE(p_due_date, due_date),
+    total_cents = COALESCE(p_total_cents, total_cents),
+    updated_at = NOW()
+  WHERE id = p_installment_id;
+  
+  -- Recalculate plan total if amount changed
+  IF p_total_cents IS NOT NULL THEN
+    SELECT SUM(total_cents) INTO v_new_plan_total
+    FROM public.installments WHERE plan_id = v_plan_id;
+    
+    UPDATE public.plans
+    SET total_amount_cents = v_new_plan_total, updated_at = NOW()
+    WHERE id = v_plan_id;
+  END IF;
+  
+  -- Audit log
+  INSERT INTO public.audit_log (tenant_id, user_id, action, entity_type, entity_id, old_data, new_data)
+  VALUES (
+    v_tenant_id,
+    v_user_id,
+    'installment_edited',
+    'installment',
+    p_installment_id,
+    json_build_object('due_date', v_old_due_date, 'total_cents', v_old_total_cents),
+    json_build_object('due_date', COALESCE(p_due_date, v_old_due_date), 'total_cents', COALESCE(p_total_cents, v_old_total_cents))
+  );
+  
+  RETURN json_build_object('success', true);
+END;
+$$;
+
+REVOKE ALL ON FUNCTION public.edit_installment(UUID, DATE, INTEGER) FROM PUBLIC;
+REVOKE ALL ON FUNCTION public.edit_installment(UUID, DATE, INTEGER) FROM anon;
+GRANT EXECUTE ON FUNCTION public.edit_installment(UUID, DATE, INTEGER) TO authenticated;
+
+-- ============================================================================
 -- FIX RECURSIVE/BROKEN RLS POLICIES
 -- ============================================================================
 
@@ -553,18 +949,15 @@ CREATE POLICY "Members can delete draft installments"
   ));
 
 -- ============================================================================
--- PAYMENTS: Fix INSERT policy (no UPDATE/DELETE - immutable records)
+-- PAYMENTS: No direct client INSERT/UPDATE/DELETE - only via register_payment RPC
 -- tenant_id, plan_id, installment_id all immutable via trigger
 -- ============================================================================
 
 DROP POLICY IF EXISTS "Users can insert payments" ON public.payments;
+DROP POLICY IF EXISTS "Members can insert payments" ON public.payments;
 
-CREATE POLICY "Members can insert payments"
-  ON public.payments FOR INSERT
-  WITH CHECK (public.is_tenant_member(tenant_id));
-
--- No UPDATE policy for payments - payment records are immutable
--- No DELETE policy for payments - use reversal payments instead
+-- SELECT only - viewing payments is allowed for tenant members
+-- INSERT/UPDATE/DELETE only via register_payment RPC (SECURITY DEFINER bypasses RLS)
 
 -- ============================================================================
 -- AUDIT_LOG: Remove client INSERT policy - audit only via triggers/definer
