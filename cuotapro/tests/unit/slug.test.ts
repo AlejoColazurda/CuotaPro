@@ -61,8 +61,9 @@ describe('generateSlug', () => {
 });
 
 describe('addSlugSuffix', () => {
-  it('adds numeric suffix to slug', () => {
+  it('adds numeric suffix to slug (starts at 2 per SQL convention)', () => {
     expect(addSlugSuffix('mi-tienda', 2)).toBe('mi-tienda-2');
+    expect(addSlugSuffix('mi-tienda', 3)).toBe('mi-tienda-3');
     expect(addSlugSuffix('negocio', 100)).toBe('negocio-100');
   });
 });

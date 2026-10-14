@@ -7,6 +7,8 @@ export function generateSlug(name: string): string {
     return 'negocio';
   }
 
+  // Normalize: lowercase first, then remove accents, then clean
+  // This matches the SQL: lower(trim(...)), then unaccent, then regex
   const slug = name
     .toLowerCase()
     .trim()
@@ -34,6 +36,7 @@ export function generateSlug(name: string): string {
 
 /**
  * Add a numeric suffix to make a slug unique
+ * Suffix starts at 2 to match SQL behavior (mi-tienda, mi-tienda-2, mi-tienda-3...)
  */
 export function addSlugSuffix(baseSlug: string, suffix: number): string {
   return `${baseSlug}-${suffix}`;
