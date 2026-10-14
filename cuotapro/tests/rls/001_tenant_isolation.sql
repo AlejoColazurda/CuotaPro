@@ -9,7 +9,7 @@ BEGIN;
 -- Load pgTAP extension
 CREATE EXTENSION IF NOT EXISTS pgtap;
 
-SELECT plan(44);
+SELECT plan(45);
 
 -- ============================================================================
 -- Setup: Create test users and data AS SUPERUSER (bypass RLS for setup)
@@ -321,9 +321,21 @@ RESET ROLE;
 SELECT test_set_user('11111111-1111-1111-1111-111111111111');
 SET LOCAL ROLE authenticated;
 
+-- Record Art. 36 acceptance first (required by migration 003)
+SELECT lives_ok(
+  $$SELECT public.record_art36_acceptance(
+    'eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee'::uuid,
+    'https://example.com/art36.pdf',
+    '1.0',
+    'a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2',
+    '127.0.0.1'::inet
+  )$$,
+  'Test 20a: record_art36_acceptance succeeds for draft plan'
+);
+
 SELECT lives_ok(
   $$SELECT public.activate_plan('eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee'::uuid)$$,
-  'Test 20: activate_plan RPC succeeds for draft plan'
+  'Test 20: activate_plan RPC succeeds for draft plan (after Art. 36 acceptance)'
 );
 
 RESET ROLE;
