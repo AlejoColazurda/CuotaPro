@@ -49,6 +49,36 @@ interface UpcomingInstallment {
   client_name: string;
 }
 
+interface InstallmentWithPlan {
+  id: string;
+  status: string;
+  total_cents: number;
+  paid_cents: number;
+  due_date: string;
+  plans: { tenant_id: string };
+}
+
+interface PlanWithClient {
+  id: string;
+  description: string;
+  status: string;
+  total_amount_cents: number;
+  created_at: string;
+  clients: { full_name: string } | null;
+}
+
+interface InstallmentWithPlanAndClient {
+  id: string;
+  number: number;
+  due_date: string;
+  total_cents: number;
+  plans: {
+    description: string;
+    tenant_id: string;
+    clients: { full_name: string } | null;
+  };
+}
+
 export default function DashboardPage() {
   const [stats, setStats] = useState<DashboardStats | null>(null);
   const [recentPlans, setRecentPlans] = useState<RecentPlan[]>([]);
@@ -88,12 +118,14 @@ export default function DashboardPage() {
           .in('status', ['pending', 'partial', 'overdue']),
       ]);
 
-      const pendingInstallments = installmentsRes.data?.filter(
+      const installmentsData = (installmentsRes.data || []) as unknown as InstallmentWithPlan[];
+
+      const pendingInstallments = installmentsData.filter(
         (i) => i.status === 'pending' || i.status === 'partial'
-      ) || [];
-      const overdueInstallments = installmentsRes.data?.filter(
+      );
+      const overdueInstallments = installmentsData.filter(
         (i) => i.status === 'overdue' || (new Date(i.due_date) < new Date() && i.status !== 'paid')
-      ) || [];
+      );
 
       const totalPending = pendingInstallments.reduce(
         (sum, i) => sum + (i.total_cents - i.paid_cents),
@@ -121,14 +153,14 @@ export default function DashboardPage() {
         `)
         .eq('tenant_id', tenantId)
         .order('created_at', { ascending: false })
-        .limit(5);
+        .limit(5) as { data: PlanWithClient[] | null };
 
       setRecentPlans(
         recent?.map((p) => ({
           id: p.id,
           description: p.description,
           status: p.status,
-          client_name: (p.clients as { full_name: string })?.full_name || 'Sin cliente',
+          client_name: p.clients?.full_name || 'Sin cliente',
           total_amount_cents: p.total_amount_cents,
           created_at: p.created_at,
         })) || []
@@ -144,7 +176,7 @@ export default function DashboardPage() {
         .in('status', ['pending', 'partial'])
         .gte('due_date', new Date().toISOString().split('T')[0])
         .order('due_date', { ascending: true })
-        .limit(5);
+        .limit(5) as { data: InstallmentWithPlanAndClient[] | null };
 
       setUpcomingInstallments(
         upcoming?.map((i) => ({
@@ -152,8 +184,8 @@ export default function DashboardPage() {
           number: i.number,
           due_date: i.due_date,
           total_cents: i.total_cents,
-          plan_description: (i.plans as { description: string }).description,
-          client_name: ((i.plans as { clients: { full_name: string } }).clients)?.full_name || 'Sin cliente',
+          plan_description: i.plans.description,
+          client_name: i.plans.clients?.full_name || 'Sin cliente',
         })) || []
       );
 

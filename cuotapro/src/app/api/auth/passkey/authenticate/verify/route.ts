@@ -5,6 +5,17 @@ import { createClient } from '@/lib/supabase/server';
 const rpID = process.env.WEBAUTHN_RP_ID || 'localhost';
 const origin = process.env.WEBAUTHN_ORIGIN || `https://${rpID}`;
 
+interface PasskeyWithProfile {
+  id: string;
+  user_id: string;
+  credential_id: string;
+  public_key: string;
+  counter: number;
+  device_type: string | null;
+  transports: string[] | null;
+  user_profiles: { id: string; email: string };
+}
+
 export async function POST(request: NextRequest) {
   try {
     const body = await request.json();
@@ -16,7 +27,7 @@ export async function POST(request: NextRequest) {
       .from('passkeys')
       .select('*, user_profiles!inner(id, email)')
       .eq('credential_id', credential.id)
-      .single();
+      .single() as { data: PasskeyWithProfile | null };
 
     if (!passkey) {
       return NextResponse.json(
@@ -60,14 +71,14 @@ export async function POST(request: NextRequest) {
       .update({
         counter: verification.authenticationInfo.newCounter,
         last_used_at: new Date().toISOString(),
-      })
+      } as Record<string, unknown>)
       .eq('id', passkey.id);
 
     await supabase.from('audit_log').insert({
       user_id: passkey.user_id,
       action: 'user_login',
       new_data: { method: 'passkey', device_type: passkey.device_type },
-    });
+    } as Record<string, unknown>);
 
     return NextResponse.json({ verified: true });
   } catch (error) {

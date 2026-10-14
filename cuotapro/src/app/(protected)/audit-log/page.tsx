@@ -9,13 +9,13 @@ import { EmptyState } from '@/components/ui/empty-state';
 import { History } from 'lucide-react';
 import { format } from 'date-fns';
 import { es } from 'date-fns/locale';
-import type { AuditLogEntry, AuditAction } from '@/types/database';
+import type { AuditLogEntry } from '@/types/database';
 
 interface AuditLogWithUser extends AuditLogEntry {
   user_profiles?: { full_name: string | null; email: string } | null;
 }
 
-const actionLabels: Record<AuditAction, { label: string; variant: 'default' | 'secondary' | 'success' | 'warning' | 'destructive' }> = {
+const actionLabels: Record<string, { label: string; variant: 'default' | 'secondary' | 'success' | 'warning' | 'destructive' }> = {
   plan_created: { label: 'Plan Creado', variant: 'success' },
   plan_activated: { label: 'Plan Activado', variant: 'success' },
   plan_cancelled: { label: 'Plan Cancelado', variant: 'destructive' },

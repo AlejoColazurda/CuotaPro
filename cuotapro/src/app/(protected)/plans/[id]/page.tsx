@@ -123,7 +123,7 @@ export default function PlanDetailPage() {
       `)
       .eq('id', planId)
       .eq('tenant_id', tenantUser.tenant_id)
-      .single();
+      .single() as { data: PlanDetail | null; error: unknown };
 
     if (fetchError || !data) {
       setError('No se encontró el plan');
@@ -131,14 +131,14 @@ export default function PlanDetailPage() {
       return;
     }
 
-    const installments = (data.installments as Installment[]).sort(
+    const installments = (data.installments || []).sort(
       (a, b) => a.number - b.number
     );
 
     setPlan({
       ...data,
       installments,
-    } as PlanDetail);
+    });
     setIsLoading(false);
   }, [planId]);
 
@@ -155,9 +155,9 @@ export default function PlanDetailPage() {
     const { error } = await supabase
       .from('plans')
       .update({
-        status: 'active',
+        status: 'active' as const,
         activated_at: new Date().toISOString(),
-      })
+      } as Record<string, unknown>)
       .eq('id', plan.id);
 
     if (error) {
@@ -168,7 +168,7 @@ export default function PlanDetailPage() {
         action: 'plan_activated',
         entity_type: 'plan',
         entity_id: plan.id,
-      });
+      } as Record<string, unknown>);
 
       toast.success('Plan activado. Las cuotas ya no pueden editarse.');
       fetchPlan();
@@ -187,9 +187,9 @@ export default function PlanDetailPage() {
     const { error } = await supabase
       .from('plans')
       .update({
-        status: 'cancelled',
+        status: 'cancelled' as const,
         cancelled_at: new Date().toISOString(),
-      })
+      } as Record<string, unknown>)
       .eq('id', plan.id);
 
     if (error) {
@@ -200,7 +200,7 @@ export default function PlanDetailPage() {
         action: 'plan_cancelled',
         entity_type: 'plan',
         entity_id: plan.id,
-      });
+      } as Record<string, unknown>);
 
       toast.success('Plan cancelado');
       fetchPlan();
@@ -268,7 +268,7 @@ export default function PlanDetailPage() {
       amount_cents: principalPaid,
       penalty_paid_cents: penaltyPaid,
       recorded_by: user.id,
-    });
+    } as Record<string, unknown>);
 
     if (paymentError) {
       toast.error('Error al registrar el pago');
@@ -282,7 +282,7 @@ export default function PlanDetailPage() {
         paid_cents: newPaidCents,
         penalty_cents: selectedInstallment.penalty_cents + penaltyPaid,
         status: isPaid ? 'paid' : 'partial',
-      })
+      } as Record<string, unknown>)
       .eq('id', selectedInstallment.id);
 
     if (installmentError) {
@@ -299,17 +299,17 @@ export default function PlanDetailPage() {
         installment_number: selectedInstallment.number,
         amount: amountCents,
       },
-    });
+    } as Record<string, unknown>);
 
     const updatedInstallments = await supabase
       .from('installments')
       .select('*')
-      .eq('plan_id', plan.id);
+      .eq('plan_id', plan.id) as { data: Installment[] | null };
 
     const allPaid = updatedInstallments.data?.every((i) => i.status === 'paid');
 
     if (allPaid) {
-      await supabase.from('plans').update({ status: 'completed' }).eq('id', plan.id);
+      await supabase.from('plans').update({ status: 'completed' } as Record<string, unknown>).eq('id', plan.id);
     }
 
     toast.success('Pago registrado');
@@ -367,7 +367,7 @@ export default function PlanDetailPage() {
       .update({
         due_date: editingInstallment.dueDate,
         total_cents: editingInstallment.totalCents,
-      })
+      } as Record<string, unknown>)
       .eq('id', editingInstallment.id);
 
     if (error) {
@@ -382,7 +382,7 @@ export default function PlanDetailPage() {
 
       await supabase
         .from('plans')
-        .update({ total_amount_cents: newTotal })
+        .update({ total_amount_cents: newTotal } as Record<string, unknown>)
         .eq('id', plan.id);
 
       await supabase.from('audit_log').insert({
@@ -394,7 +394,7 @@ export default function PlanDetailPage() {
           due_date: editingInstallment.dueDate,
           total_cents: editingInstallment.totalCents,
         },
-      });
+      } as Record<string, unknown>);
 
       toast.success('Cuota actualizada');
       setEditingInstallment(null);

@@ -134,8 +134,9 @@ export default function SettingsPage() {
         .eq('user_id', user.id)
         .order('created_at', { ascending: false });
 
-      if ((tenantRes.data as { tenants?: unknown })?.tenants) {
-        const t = (tenantRes.data as { tenants: Tenant }).tenants;
+      const tenantData = tenantRes.data as unknown as { tenants?: Tenant } | null;
+      if (tenantData?.tenants) {
+        const t = tenantData.tenants;
         setTenant(t);
         reset({
           name: t.name,
@@ -181,7 +182,7 @@ export default function SettingsPage() {
         default_grace_days: data.default_grace_days,
         default_penalty_rate: data.default_penalty_rate,
         max_penalty_cap: data.max_penalty_cap,
-      })
+      } as Record<string, unknown>)
       .eq('id', tenant.id);
 
     if (error) {
@@ -192,7 +193,7 @@ export default function SettingsPage() {
         action: 'settings_updated',
         entity_type: 'tenant',
         entity_id: tenant.id,
-      });
+      } as Record<string, unknown>);
 
       toast.success('Configuración guardada');
     }
@@ -310,8 +311,8 @@ export default function SettingsPage() {
       const { data: updatedProfile } = await supabase
         .from('user_profiles')
         .select('*')
-        .eq('id', profile?.id)
-        .single();
+        .eq('id', profile?.id || '')
+        .single() as { data: UserProfile | null };
       if (updatedProfile) setProfile(updatedProfile);
 
       setIsRecoveryCodesDialogOpen(true);
@@ -350,8 +351,8 @@ export default function SettingsPage() {
       const { data: updatedProfile } = await supabase
         .from('user_profiles')
         .select('*')
-        .eq('id', profile?.id)
-        .single();
+        .eq('id', profile?.id || '')
+        .single() as { data: UserProfile | null };
       if (updatedProfile) setProfile(updatedProfile);
     } catch {
       toast.error('Error al deshabilitar 2FA');

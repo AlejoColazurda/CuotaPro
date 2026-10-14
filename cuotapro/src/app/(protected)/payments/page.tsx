@@ -28,6 +28,16 @@ interface InstallmentWithPlan extends Installment {
   };
 }
 
+interface InstallmentForStats {
+  id: string;
+  status: string;
+  total_cents: number;
+  paid_cents: number;
+  due_date: string;
+  updated_at: string;
+  plans: { tenant_id: string; status: string };
+}
+
 const statusLabels: Record<
   string,
   { label: string; variant: 'default' | 'secondary' | 'success' | 'warning' | 'destructive' }
@@ -100,7 +110,7 @@ export default function PaymentsPage() {
       .eq('plans.tenant_id', tenantUser.tenant_id)
       .eq('plans.status', 'active');
 
-    const all = allInstallments.data || [];
+    const all = (allInstallments.data || []) as InstallmentForStats[];
 
     const pending = all.filter((i) => i.status === 'pending' || i.status === 'partial');
     const overdue = pending.filter((i) => new Date(i.due_date) < today);

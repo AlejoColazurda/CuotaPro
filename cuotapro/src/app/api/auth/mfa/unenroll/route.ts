@@ -40,7 +40,7 @@ export async function POST(request: NextRequest) {
         totp_secret: null,
         totp_verified_at: null,
         recovery_codes: null,
-      })
+      } as Record<string, unknown>)
       .eq('id', user.id);
 
     return NextResponse.json({ success: true });

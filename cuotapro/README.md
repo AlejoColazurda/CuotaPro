@@ -131,7 +131,7 @@ Si vas a usar `demo.potenciapp.com`:
 
 La aplicación soporta rutas por tenant:
 
-- `demo.potenciapp.com/web/distribuidorabemberg` - Portal del tenant "distribuidorabemberg"
+- `demo.potenciapp.com/web/mi-comercio` - Portal del tenant "mi-comercio"
 
 El slug del tenant se define al crear la cuenta y no puede cambiarse.
 

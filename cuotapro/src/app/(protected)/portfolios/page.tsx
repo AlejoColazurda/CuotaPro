@@ -89,7 +89,7 @@ export default function PortfoliosPage() {
       .from('portfolios')
       .select('*')
       .eq('tenant_id', tenantUser.tenant_id)
-      .order('created_at', { ascending: false });
+      .order('created_at', { ascending: false }) as { data: Portfolio[] | null };
 
     if (portfoliosData) {
       const withCounts = await Promise.all(
@@ -157,7 +157,7 @@ export default function PortfoliosPage() {
     if (editingPortfolio) {
       const { error } = await supabase
         .from('portfolios')
-        .update(portfolioData)
+        .update(portfolioData as Record<string, unknown>)
         .eq('id', editingPortfolio.id);
 
       if (error) {
@@ -172,17 +172,17 @@ export default function PortfoliosPage() {
         entity_id: editingPortfolio.id,
         old_data: editingPortfolio,
         new_data: portfolioData,
-      });
+      } as Record<string, unknown>);
 
       toast.success('Cartera actualizada');
     } else {
       const { data: newPortfolio, error } = await supabase
         .from('portfolios')
-        .insert(portfolioData)
+        .insert(portfolioData as Record<string, unknown>)
         .select()
-        .single();
+        .single() as { data: { id: string } | null; error: unknown };
 
-      if (error) {
+      if (error || !newPortfolio) {
         toast.error('Error al crear la cartera');
         return;
       }
@@ -193,7 +193,7 @@ export default function PortfoliosPage() {
         entity_type: 'portfolio',
         entity_id: newPortfolio.id,
         new_data: newPortfolio,
-      });
+      } as Record<string, unknown>);
 
       toast.success('Cartera creada');
     }
