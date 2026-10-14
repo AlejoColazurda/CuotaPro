@@ -3,12 +3,220 @@
 --   - No INSERT policy on tenants (42501)
 --   - Recursive policy on tenant_users (42P17)
 --   - First owner cannot insert into tenant_users
+--   - Prevent tenant hopping via UPDATE
 
 -- ============================================================================
 -- EXTENSIONS (in extensions schema for security)
 -- ============================================================================
 
 CREATE EXTENSION IF NOT EXISTS unaccent WITH SCHEMA extensions;
+
+-- ============================================================================
+-- IMMUTABLE FIELD TRIGGERS (prevent tenant hopping)
+-- ============================================================================
+
+-- Generic function to prevent changes to immutable columns
+CREATE OR REPLACE FUNCTION public.prevent_immutable_change()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SET search_path = ''
+AS $$
+BEGIN
+  RAISE EXCEPTION 'Cannot modify immutable field(s)' USING ERRCODE = '23514';
+END;
+$$;
+
+-- tenant_users: prevent changes to tenant_id and user_id
+CREATE OR REPLACE FUNCTION public.tenant_users_immutable_check()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SET search_path = ''
+AS $$
+BEGIN
+  IF NEW.tenant_id IS DISTINCT FROM OLD.tenant_id THEN
+    RAISE EXCEPTION 'Cannot change tenant_id' USING ERRCODE = '23514';
+  END IF;
+  IF NEW.user_id IS DISTINCT FROM OLD.user_id THEN
+    RAISE EXCEPTION 'Cannot change user_id' USING ERRCODE = '23514';
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS tenant_users_immutable ON public.tenant_users;
+CREATE TRIGGER tenant_users_immutable
+  BEFORE UPDATE ON public.tenant_users
+  FOR EACH ROW
+  EXECUTE FUNCTION public.tenant_users_immutable_check();
+
+-- clients: prevent changes to tenant_id
+CREATE OR REPLACE FUNCTION public.clients_immutable_check()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SET search_path = ''
+AS $$
+BEGIN
+  IF NEW.tenant_id IS DISTINCT FROM OLD.tenant_id THEN
+    RAISE EXCEPTION 'Cannot change tenant_id' USING ERRCODE = '23514';
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS clients_immutable ON public.clients;
+CREATE TRIGGER clients_immutable
+  BEFORE UPDATE ON public.clients
+  FOR EACH ROW
+  EXECUTE FUNCTION public.clients_immutable_check();
+
+-- portfolios: prevent changes to tenant_id
+CREATE OR REPLACE FUNCTION public.portfolios_immutable_check()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SET search_path = ''
+AS $$
+BEGIN
+  IF NEW.tenant_id IS DISTINCT FROM OLD.tenant_id THEN
+    RAISE EXCEPTION 'Cannot change tenant_id' USING ERRCODE = '23514';
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS portfolios_immutable ON public.portfolios;
+CREATE TRIGGER portfolios_immutable
+  BEFORE UPDATE ON public.portfolios
+  FOR EACH ROW
+  EXECUTE FUNCTION public.portfolios_immutable_check();
+
+-- plans: prevent changes to tenant_id and client_id
+CREATE OR REPLACE FUNCTION public.plans_immutable_check()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SET search_path = ''
+AS $$
+BEGIN
+  IF NEW.tenant_id IS DISTINCT FROM OLD.tenant_id THEN
+    RAISE EXCEPTION 'Cannot change tenant_id' USING ERRCODE = '23514';
+  END IF;
+  IF NEW.client_id IS DISTINCT FROM OLD.client_id THEN
+    RAISE EXCEPTION 'Cannot change client_id' USING ERRCODE = '23514';
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS plans_immutable ON public.plans;
+CREATE TRIGGER plans_immutable
+  BEFORE UPDATE ON public.plans
+  FOR EACH ROW
+  EXECUTE FUNCTION public.plans_immutable_check();
+
+-- installments: prevent changes to plan_id
+CREATE OR REPLACE FUNCTION public.installments_immutable_check()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SET search_path = ''
+AS $$
+BEGIN
+  IF NEW.plan_id IS DISTINCT FROM OLD.plan_id THEN
+    RAISE EXCEPTION 'Cannot change plan_id' USING ERRCODE = '23514';
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS installments_immutable ON public.installments;
+CREATE TRIGGER installments_immutable
+  BEFORE UPDATE ON public.installments
+  FOR EACH ROW
+  EXECUTE FUNCTION public.installments_immutable_check();
+
+-- payments: prevent changes to tenant_id, plan_id, installment_id
+CREATE OR REPLACE FUNCTION public.payments_immutable_check()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SET search_path = ''
+AS $$
+BEGIN
+  IF NEW.tenant_id IS DISTINCT FROM OLD.tenant_id THEN
+    RAISE EXCEPTION 'Cannot change tenant_id' USING ERRCODE = '23514';
+  END IF;
+  IF NEW.plan_id IS DISTINCT FROM OLD.plan_id THEN
+    RAISE EXCEPTION 'Cannot change plan_id' USING ERRCODE = '23514';
+  END IF;
+  IF NEW.installment_id IS DISTINCT FROM OLD.installment_id THEN
+    RAISE EXCEPTION 'Cannot change installment_id' USING ERRCODE = '23514';
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS payments_immutable ON public.payments;
+CREATE TRIGGER payments_immutable
+  BEFORE UPDATE ON public.payments
+  FOR EACH ROW
+  EXECUTE FUNCTION public.payments_immutable_check();
+
+-- api_keys: prevent changes to tenant_id
+CREATE OR REPLACE FUNCTION public.api_keys_immutable_check()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SET search_path = ''
+AS $$
+BEGIN
+  IF NEW.tenant_id IS DISTINCT FROM OLD.tenant_id THEN
+    RAISE EXCEPTION 'Cannot change tenant_id' USING ERRCODE = '23514';
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS api_keys_immutable ON public.api_keys;
+CREATE TRIGGER api_keys_immutable
+  BEFORE UPDATE ON public.api_keys
+  FOR EACH ROW
+  EXECUTE FUNCTION public.api_keys_immutable_check();
+
+-- passkeys: prevent changes to user_id
+CREATE OR REPLACE FUNCTION public.passkeys_immutable_check()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SET search_path = ''
+AS $$
+BEGIN
+  IF NEW.user_id IS DISTINCT FROM OLD.user_id THEN
+    RAISE EXCEPTION 'Cannot change user_id' USING ERRCODE = '23514';
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS passkeys_immutable ON public.passkeys;
+CREATE TRIGGER passkeys_immutable
+  BEFORE UPDATE ON public.passkeys
+  FOR EACH ROW
+  EXECUTE FUNCTION public.passkeys_immutable_check();
+
+-- sessions: prevent changes to user_id
+CREATE OR REPLACE FUNCTION public.sessions_immutable_check()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SET search_path = ''
+AS $$
+BEGIN
+  IF NEW.user_id IS DISTINCT FROM OLD.user_id THEN
+    RAISE EXCEPTION 'Cannot change user_id' USING ERRCODE = '23514';
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS sessions_immutable ON public.sessions;
+CREATE TRIGGER sessions_immutable
+  BEFORE UPDATE ON public.sessions
+  FOR EACH ROW
+  EXECUTE FUNCTION public.sessions_immutable_check();
 
 -- ============================================================================
 -- HELPER FUNCTIONS (SECURITY DEFINER with search_path protection)
@@ -190,6 +398,7 @@ DROP POLICY IF EXISTS "Owners can manage API keys" ON public.api_keys;
 
 -- ============================================================================
 -- TENANT_USERS: Fix recursive policy
+-- Note: tenant_id and user_id cannot change (enforced by trigger)
 -- ============================================================================
 
 -- Users can view their own membership
@@ -211,10 +420,15 @@ CREATE POLICY "Owners can insert tenant members"
   );
 
 -- Owners can update members (not themselves, cannot promote to owner)
+-- Full constraint in WITH CHECK since tenant_id/user_id are immutable via trigger
 CREATE POLICY "Owners can update tenant members"
   ON public.tenant_users FOR UPDATE
   USING (public.is_tenant_owner(tenant_id) AND user_id != auth.uid())
-  WITH CHECK (role != 'owner');
+  WITH CHECK (
+    public.is_tenant_owner(tenant_id)
+    AND user_id != auth.uid()
+    AND role != 'owner'
+  );
 
 -- Owners can delete members (not themselves)
 CREATE POLICY "Owners can delete tenant members"
@@ -231,7 +445,7 @@ CREATE POLICY "Owners can update their tenants"
   WITH CHECK (public.is_tenant_owner(id));
 
 -- ============================================================================
--- API_KEYS: Fix recursive policy
+-- API_KEYS: Fix recursive policy (tenant_id immutable via trigger)
 -- ============================================================================
 
 CREATE POLICY "Owners can manage API keys"
@@ -240,7 +454,7 @@ CREATE POLICY "Owners can manage API keys"
   WITH CHECK (public.is_tenant_owner(tenant_id));
 
 -- ============================================================================
--- PORTFOLIOS: Ensure INSERT works
+-- PORTFOLIOS: Ensure INSERT works (tenant_id immutable via trigger)
 -- ============================================================================
 
 DROP POLICY IF EXISTS "Users can manage portfolios" ON public.portfolios;
@@ -259,7 +473,7 @@ CREATE POLICY "Owners can delete portfolios"
   USING (public.is_tenant_owner(tenant_id));
 
 -- ============================================================================
--- CLIENTS: Ensure INSERT works
+-- CLIENTS: Ensure INSERT works (tenant_id immutable via trigger)
 -- ============================================================================
 
 DROP POLICY IF EXISTS "Users can manage clients" ON public.clients;
@@ -278,7 +492,7 @@ CREATE POLICY "Owners can delete clients"
   USING (public.is_tenant_owner(tenant_id));
 
 -- ============================================================================
--- PLANS: Ensure INSERT works
+-- PLANS: Ensure INSERT works (tenant_id, client_id immutable via trigger)
 -- ============================================================================
 
 DROP POLICY IF EXISTS "Users can manage plans" ON public.plans;
@@ -297,7 +511,7 @@ CREATE POLICY "Members can delete draft plans"
   USING (public.is_tenant_member(tenant_id) AND status = 'draft');
 
 -- ============================================================================
--- INSTALLMENTS: Fix INSERT/UPDATE/DELETE policies
+-- INSTALLMENTS: Fix INSERT/UPDATE/DELETE policies (plan_id immutable via trigger)
 -- ============================================================================
 
 DROP POLICY IF EXISTS "Users can insert installments" ON public.installments;
@@ -339,7 +553,8 @@ CREATE POLICY "Members can delete draft installments"
   ));
 
 -- ============================================================================
--- PAYMENTS: Fix INSERT policy (no DELETE - use reversal payments instead)
+-- PAYMENTS: Fix INSERT policy (no UPDATE/DELETE - immutable records)
+-- tenant_id, plan_id, installment_id all immutable via trigger
 -- ============================================================================
 
 DROP POLICY IF EXISTS "Users can insert payments" ON public.payments;
@@ -348,6 +563,7 @@ CREATE POLICY "Members can insert payments"
   ON public.payments FOR INSERT
   WITH CHECK (public.is_tenant_member(tenant_id));
 
+-- No UPDATE policy for payments - payment records are immutable
 -- No DELETE policy for payments - use reversal payments instead
 
 -- ============================================================================
@@ -360,7 +576,7 @@ DROP POLICY IF EXISTS "Authenticated users can insert audit log" ON public.audit
 -- No INSERT policy for clients - audit log written only by SECURITY DEFINER functions or triggers
 
 -- ============================================================================
--- PASSKEYS: Explicit per-operation policies
+-- PASSKEYS: Explicit per-operation policies (user_id immutable via trigger)
 -- ============================================================================
 
 DROP POLICY IF EXISTS "Users can manage own passkeys" ON public.passkeys;
@@ -383,7 +599,7 @@ CREATE POLICY "Users can delete own passkeys"
   USING (user_id = auth.uid());
 
 -- ============================================================================
--- SESSIONS: Explicit per-operation policies
+-- SESSIONS: Explicit per-operation policies (user_id immutable via trigger)
 -- ============================================================================
 
 DROP POLICY IF EXISTS "Users can manage own sessions" ON public.sessions;
