@@ -1,24 +1,15 @@
 'use client';
 
 import { Suspense } from 'react';
-import { LoginForm } from './login-form';
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
+import { AuthForm } from './auth-form';
+import { Card, CardContent } from '@/components/ui/card';
+import { Loader2 } from 'lucide-react';
 
-function LoginSkeleton() {
+function AuthSkeleton() {
   return (
     <Card className="w-full max-w-md">
-      <CardHeader className="text-center">
-        <CardTitle>Iniciar sesión</CardTitle>
-        <CardDescription>
-          Ingresá tus credenciales para acceder a tu cuenta
-        </CardDescription>
-      </CardHeader>
-      <CardContent>
-        <div className="space-y-4">
-          <div className="h-10 bg-gray-100 rounded animate-pulse" />
-          <div className="h-10 bg-gray-100 rounded animate-pulse" />
-          <div className="h-10 bg-gray-100 rounded animate-pulse" />
-        </div>
+      <CardContent className="flex items-center justify-center py-16">
+        <Loader2 className="h-8 w-8 animate-spin text-blue-600" />
       </CardContent>
     </Card>
   );
@@ -26,8 +17,8 @@ function LoginSkeleton() {
 
 export default function LoginPage() {
   return (
-    <Suspense fallback={<LoginSkeleton />}>
-      <LoginForm />
+    <Suspense fallback={<AuthSkeleton />}>
+      <AuthForm />
     </Suspense>
   );
 }

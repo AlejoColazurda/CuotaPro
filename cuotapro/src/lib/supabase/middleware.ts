@@ -37,13 +37,32 @@ export async function updateSession(request: NextRequest) {
   const pathname = request.nextUrl.pathname;
   
   // Public routes that don't require authentication
-  const publicRoutes = ['/login', '/signup', '/forgot-password', '/reset-password', '/verify-email'];
+  const publicRoutes = [
+    '/login', 
+    '/signup', 
+    '/forgot-password', 
+    '/reset-password', 
+    '/verify-email',
+    '/terms',
+    '/privacy',
+    '/auth/callback',
+  ];
   const isPublicRoute = publicRoutes.some(route => pathname.startsWith(route));
   const isTenantWebRoute = pathname.startsWith('/web/');
   const isApiRoute = pathname.startsWith('/api/');
 
   // Allow public routes, tenant web routes, and API routes
   if (isPublicRoute || isTenantWebRoute || isApiRoute) {
+    return supabaseResponse;
+  }
+
+  // Onboarding requires authentication but not a tenant
+  if (pathname === '/onboarding') {
+    if (!user) {
+      const url = request.nextUrl.clone();
+      url.pathname = '/login';
+      return NextResponse.redirect(url);
+    }
     return supabaseResponse;
   }
 
