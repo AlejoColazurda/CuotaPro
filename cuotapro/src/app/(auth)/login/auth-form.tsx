@@ -251,10 +251,7 @@ export function AuthForm() {
         return;
       }
 
-      await supabase.from('user_profiles').insert({
-        id: authData.user.id,
-        email: data.email,
-      });
+      // Profile will be created during onboarding via create_tenant_with_owner RPC
 
       toast.success('¡Cuenta creada! Revisá tu email para confirmarla.');
       router.push('/login?registered=true');

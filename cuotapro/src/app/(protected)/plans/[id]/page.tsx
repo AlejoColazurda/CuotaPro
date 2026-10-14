@@ -152,24 +152,14 @@ export default function PlanDetailPage() {
 
     const supabase = createClient();
 
-    const { error } = await supabase
-      .from('plans')
-      .update({
-        status: 'active' as const,
-        activated_at: new Date().toISOString(),
-      } as Record<string, unknown>)
-      .eq('id', plan.id);
+    const { error } = await supabase.rpc('activate_plan', {
+      p_plan_id: plan.id,
+    });
 
     if (error) {
-      toast.error('Error al activar el plan');
+      const message = error.message || 'Error al activar el plan';
+      toast.error(message);
     } else {
-      await supabase.from('audit_log').insert({
-        tenant_id: plan.tenant_id,
-        action: 'plan_activated',
-        entity_type: 'plan',
-        entity_id: plan.id,
-      } as Record<string, unknown>);
-
       toast.success('Plan activado. Las cuotas ya no pueden editarse.');
       fetchPlan();
     }
@@ -184,24 +174,14 @@ export default function PlanDetailPage() {
 
     const supabase = createClient();
 
-    const { error } = await supabase
-      .from('plans')
-      .update({
-        status: 'cancelled' as const,
-        cancelled_at: new Date().toISOString(),
-      } as Record<string, unknown>)
-      .eq('id', plan.id);
+    const { error } = await supabase.rpc('cancel_plan', {
+      p_plan_id: plan.id,
+    });
 
     if (error) {
-      toast.error('Error al cancelar el plan');
+      const message = error.message || 'Error al cancelar el plan';
+      toast.error(message);
     } else {
-      await supabase.from('audit_log').insert({
-        tenant_id: plan.tenant_id,
-        action: 'plan_cancelled',
-        entity_type: 'plan',
-        entity_id: plan.id,
-      } as Record<string, unknown>);
-
       toast.success('Plan cancelado');
       fetchPlan();
     }
@@ -230,20 +210,13 @@ export default function PlanDetailPage() {
     setIsProcessing(true);
 
     const amountCents = Math.round(parseFloat(paymentAmount) * 100);
-    if (amountCents <= 0) {
+    if (isNaN(amountCents) || amountCents <= 0) {
       toast.error('Ingresá un monto válido');
       setIsProcessing(false);
       return;
     }
 
     const supabase = createClient();
-    const { data: { user } } = await supabase.auth.getUser();
-
-    if (!user) {
-      toast.error('No autenticado');
-      setIsProcessing(false);
-      return;
-    }
 
     const outstanding = selectedInstallment.total_cents - selectedInstallment.paid_cents;
     const penalty = calculatePenalty(
@@ -258,61 +231,25 @@ export default function PlanDetailPage() {
     const penaltyPaid = Math.min(penalty, amountCents);
     const principalPaid = Math.min(Math.max(0, amountCents - penaltyPaid), outstanding);
 
-    const newPaidCents = selectedInstallment.paid_cents + principalPaid;
-    const isPaid = newPaidCents >= selectedInstallment.total_cents;
+    const { data, error } = await supabase.rpc('register_payment', {
+      p_installment_id: selectedInstallment.id,
+      p_amount_cents: principalPaid,
+      p_penalty_paid_cents: penaltyPaid,
+    }) as { data: { payment_id: string; plan_completed: boolean } | null; error: { message?: string } | null };
 
-    const { error: paymentError } = await supabase.from('payments').insert({
-      tenant_id: plan.tenant_id,
-      plan_id: plan.id,
-      installment_id: selectedInstallment.id,
-      amount_cents: principalPaid,
-      penalty_paid_cents: penaltyPaid,
-      recorded_by: user.id,
-    } as Record<string, unknown>);
-
-    if (paymentError) {
-      toast.error('Error al registrar el pago');
+    if (error) {
+      const message = error.message || 'Error al registrar el pago';
+      toast.error(message);
       setIsProcessing(false);
       return;
     }
 
-    const { error: installmentError } = await supabase
-      .from('installments')
-      .update({
-        paid_cents: newPaidCents,
-        penalty_cents: selectedInstallment.penalty_cents + penaltyPaid,
-        status: isPaid ? 'paid' : 'partial',
-      } as Record<string, unknown>)
-      .eq('id', selectedInstallment.id);
-
-    if (installmentError) {
-      toast.error('Error al actualizar la cuota');
-      setIsProcessing(false);
-      return;
+    if (data?.plan_completed) {
+      toast.success('Pago registrado. ¡Plan completado!');
+    } else {
+      toast.success('Pago registrado');
     }
-
-    await supabase.from('audit_log').insert({
-      tenant_id: plan.tenant_id,
-      action: 'payment_recorded',
-      entity_type: 'payment',
-      new_data: {
-        installment_number: selectedInstallment.number,
-        amount: amountCents,
-      },
-    } as Record<string, unknown>);
-
-    const updatedInstallments = await supabase
-      .from('installments')
-      .select('*')
-      .eq('plan_id', plan.id) as { data: Installment[] | null };
-
-    const allPaid = updatedInstallments.data?.every((i) => i.status === 'paid');
-
-    if (allPaid) {
-      await supabase.from('plans').update({ status: 'completed' } as Record<string, unknown>).eq('id', plan.id);
-    }
-
-    toast.success('Pago registrado');
+    
     setIsPaymentDialogOpen(false);
     fetchPlan();
     setIsProcessing(false);
@@ -362,40 +299,16 @@ export default function PlanDetailPage() {
 
     const supabase = createClient();
 
-    const { error } = await supabase
-      .from('installments')
-      .update({
-        due_date: editingInstallment.dueDate,
-        total_cents: editingInstallment.totalCents,
-      } as Record<string, unknown>)
-      .eq('id', editingInstallment.id);
+    const { error } = await supabase.rpc('edit_installment', {
+      p_installment_id: editingInstallment.id,
+      p_due_date: editingInstallment.dueDate,
+      p_total_cents: editingInstallment.totalCents,
+    });
 
     if (error) {
-      toast.error('Error al guardar cambios');
+      const message = error.message || 'Error al guardar cambios';
+      toast.error(message);
     } else {
-      const newTotal = plan.installments.reduce((sum, inst) => {
-        if (inst.id === editingInstallment.id) {
-          return sum + editingInstallment.totalCents;
-        }
-        return sum + inst.total_cents;
-      }, 0);
-
-      await supabase
-        .from('plans')
-        .update({ total_amount_cents: newTotal } as Record<string, unknown>)
-        .eq('id', plan.id);
-
-      await supabase.from('audit_log').insert({
-        tenant_id: plan.tenant_id,
-        action: 'installment_edited',
-        entity_type: 'installment',
-        entity_id: editingInstallment.id,
-        new_data: {
-          due_date: editingInstallment.dueDate,
-          total_cents: editingInstallment.totalCents,
-        },
-      } as Record<string, unknown>);
-
       toast.success('Cuota actualizada');
       setEditingInstallment(null);
       fetchPlan();
