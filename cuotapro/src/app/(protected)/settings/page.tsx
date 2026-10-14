@@ -188,13 +188,6 @@ export default function SettingsPage() {
     if (error) {
       toast.error('Error al guardar');
     } else {
-      await supabase.from('audit_log').insert({
-        tenant_id: tenant.id,
-        action: 'settings_updated',
-        entity_type: 'tenant',
-        entity_id: tenant.id,
-      } as Record<string, unknown>);
-
       toast.success('Configuración guardada');
     }
 

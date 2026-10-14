@@ -9,7 +9,7 @@ import { DataTable } from '@/components/ui/data-table';
 import { EmptyState } from '@/components/ui/empty-state';
 import { StatsCard } from '@/components/ui/stats-card';
 import { Skeleton } from '@/components/ui/skeleton';
-import { formatCurrency } from '@/lib/amortization/engine';
+import { formatCurrency, parseLocalDate } from '@/lib/amortization/engine';
 import {
   CreditCard,
   Clock,
@@ -18,7 +18,7 @@ import {
   Download,
   Calendar,
 } from 'lucide-react';
-import { format, startOfMonth, endOfMonth, isWithinInterval } from 'date-fns';
+import { format, startOfMonth, endOfMonth } from 'date-fns';
 import { es } from 'date-fns/locale';
 import type { Installment, Plan, Client } from '@/types/database';
 
@@ -67,9 +67,12 @@ export default function PaymentsPage() {
     const { data: tenantUser } = await supabase
       .from('tenant_users')
       .select('tenant_id')
-      .single() as { data: { tenant_id: string } | null };
+      .maybeSingle() as { data: { tenant_id: string } | null };
 
-    if (!tenantUser) return;
+    if (!tenantUser) {
+      setIsLoading(false);
+      return;
+    }
 
     let query = supabase
       .from('installments')
@@ -101,24 +104,31 @@ export default function PaymentsPage() {
     const monthStart = startOfMonth(today);
     const monthEnd = endOfMonth(today);
 
-    const allInstallments = await supabase
-      .from('installments')
-      .select(`
-        *,
-        plans!inner(tenant_id, status)
-      `)
-      .eq('plans.tenant_id', tenantUser.tenant_id)
-      .eq('plans.status', 'active');
+    const [allInstallmentsRes, paymentsThisMonthRes] = await Promise.all([
+      supabase
+        .from('installments')
+        .select(`
+          *,
+          plans!inner(tenant_id, status)
+        `)
+        .eq('plans.tenant_id', tenantUser.tenant_id)
+        .in('plans.status', ['active', 'completed']),
+      supabase
+        .from('payments')
+        .select('amount_cents, penalty_paid_cents, created_at')
+        .eq('tenant_id', tenantUser.tenant_id)
+        .gte('created_at', monthStart.toISOString())
+        .lte('created_at', monthEnd.toISOString()),
+    ]);
 
-    const all = (allInstallments.data || []) as InstallmentForStats[];
+    const all = (allInstallmentsRes.data || []) as InstallmentForStats[];
+    const paymentsThisMonth = paymentsThisMonthRes.data || [];
 
     const pending = all.filter((i) => i.status === 'pending' || i.status === 'partial');
-    const overdue = pending.filter((i) => new Date(i.due_date) < today);
-    const paidThisMonth = all.filter(
-      (i) =>
-        i.status === 'paid' &&
-        i.updated_at &&
-        isWithinInterval(new Date(i.updated_at), { start: monthStart, end: monthEnd })
+    const overdue = pending.filter((i) => parseLocalDate(i.due_date) < today);
+    const thisMonthCollected = paymentsThisMonth.reduce(
+      (sum, p) => sum + (p.amount_cents || 0) + (p.penalty_paid_cents || 0),
+      0
     );
 
     setStats({
@@ -126,7 +136,7 @@ export default function PaymentsPage() {
       pendingAmount: pending.reduce((sum, i) => sum + (i.total_cents - i.paid_cents), 0),
       overdueCount: overdue.length,
       overdueAmount: overdue.reduce((sum, i) => sum + (i.total_cents - i.paid_cents), 0),
-      thisMonthCollected: paidThisMonth.reduce((sum, i) => sum + i.paid_cents, 0),
+      thisMonthCollected,
     });
 
     setIsLoading(false);
@@ -150,13 +160,13 @@ export default function PaymentsPage() {
     ];
 
     const rows = installments.map((i) => {
-      const isOverdue = ['pending', 'partial'].includes(i.status) && new Date(i.due_date) < new Date();
+      const isOverdue = ['pending', 'partial'].includes(i.status) && parseLocalDate(i.due_date) < new Date();
       return [
         i.plans.clients.full_name,
         i.plans.clients.dni_cuit,
         i.plans.description,
         i.number,
-        format(new Date(i.due_date), 'dd/MM/yyyy'),
+        format(parseLocalDate(i.due_date), 'dd/MM/yyyy'),
         (i.total_cents / 100).toFixed(2),
         (i.paid_cents / 100).toFixed(2),
         ((i.total_cents - i.paid_cents) / 100).toFixed(2),
@@ -195,7 +205,7 @@ export default function PaymentsPage() {
       key: 'due_date',
       header: 'Vencimiento',
       cell: (inst: InstallmentWithPlan) => {
-        const dueDate = new Date(inst.due_date);
+        const dueDate = parseLocalDate(inst.due_date);
         const isOverdue = ['pending', 'partial'].includes(inst.status) && dueDate < new Date();
         return (
           <span className={isOverdue ? 'font-medium text-red-600' : ''}>
@@ -225,7 +235,7 @@ export default function PaymentsPage() {
       cell: (inst: InstallmentWithPlan) => {
         const isOverdue =
           ['pending', 'partial'].includes(inst.status) &&
-          new Date(inst.due_date) < new Date();
+          parseLocalDate(inst.due_date) < new Date();
         return (
           <Badge variant={isOverdue ? 'destructive' : statusLabels[inst.status]?.variant}>
             {isOverdue ? 'Vencido' : statusLabels[inst.status]?.label}

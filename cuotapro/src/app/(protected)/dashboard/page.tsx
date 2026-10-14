@@ -9,7 +9,7 @@ import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { Skeleton } from '@/components/ui/skeleton';
-import { formatCurrency } from '@/lib/amortization/engine';
+import { formatCurrency, parseLocalDate } from '@/lib/amortization/engine';
 import {
   Users,
   FileText,
@@ -92,9 +92,12 @@ export default function DashboardPage() {
       const { data: tenantUser } = await supabase
         .from('tenant_users')
         .select('tenant_id')
-        .single() as { data: { tenant_id: string } | null };
+        .maybeSingle() as { data: { tenant_id: string } | null };
 
-      if (!tenantUser) return;
+      if (!tenantUser) {
+        setIsLoading(false);
+        return;
+      }
 
       const tenantId = tenantUser.tenant_id;
 
@@ -124,7 +127,7 @@ export default function DashboardPage() {
         (i) => i.status === 'pending' || i.status === 'partial'
       );
       const overdueInstallments = installmentsData.filter(
-        (i) => i.status === 'overdue' || (new Date(i.due_date) < new Date() && i.status !== 'paid')
+        (i) => i.status === 'overdue' || (parseLocalDate(i.due_date) < new Date() && i.status !== 'paid')
       );
 
       const totalPending = pendingInstallments.reduce(
@@ -335,7 +338,7 @@ export default function DashboardPage() {
                           </p>
                           <p className="flex items-center justify-end gap-1 text-sm text-gray-500">
                             <Clock className="h-3 w-3" />
-                            {format(new Date(inst.due_date), 'dd MMM', { locale: es })}
+                            {format(parseLocalDate(inst.due_date), 'dd MMM', { locale: es })}
                           </p>
                         </div>
                       </div>

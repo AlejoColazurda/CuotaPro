@@ -43,7 +43,12 @@ export default function ProtectedLayout({
         .from('tenant_users')
         .select('tenant_id, tenants(name)')
         .eq('user_id', user.id)
-        .single() as { data: { tenant_id: string; tenants: { name: string } } | null };
+        .maybeSingle() as { data: { tenant_id: string; tenants: { name: string } } | null };
+
+      if (!tenantUser) {
+        router.replace('/onboarding');
+        return;
+      }
 
       setUserData({
         user,

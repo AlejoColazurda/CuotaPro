@@ -79,9 +79,12 @@ export default function PortfoliosPage() {
     const { data: tenantUser } = await supabase
       .from('tenant_users')
       .select('tenant_id')
-      .single() as { data: { tenant_id: string } | null };
+      .maybeSingle() as { data: { tenant_id: string } | null };
 
-    if (!tenantUser) return;
+    if (!tenantUser) {
+      setIsLoading(false);
+      return;
+    }
 
     setTenantId(tenantUser.tenant_id);
 
@@ -165,15 +168,6 @@ export default function PortfoliosPage() {
         return;
       }
 
-      await supabase.from('audit_log').insert({
-        tenant_id: tenantId,
-        action: 'portfolio_created',
-        entity_type: 'portfolio',
-        entity_id: editingPortfolio.id,
-        old_data: editingPortfolio,
-        new_data: portfolioData,
-      } as Record<string, unknown>);
-
       toast.success('Cartera actualizada');
     } else {
       const { data: newPortfolio, error } = await supabase
@@ -186,14 +180,6 @@ export default function PortfoliosPage() {
         toast.error('Error al crear la cartera');
         return;
       }
-
-      await supabase.from('audit_log').insert({
-        tenant_id: tenantId,
-        action: 'portfolio_created',
-        entity_type: 'portfolio',
-        entity_id: newPortfolio.id,
-        new_data: newPortfolio,
-      } as Record<string, unknown>);
 
       toast.success('Cartera creada');
     }

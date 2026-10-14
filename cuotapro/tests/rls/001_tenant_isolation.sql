@@ -9,7 +9,7 @@ BEGIN;
 -- Load pgTAP extension
 CREATE EXTENSION IF NOT EXISTS pgtap;
 
-SELECT plan(44);
+SELECT plan(45);
 
 -- ============================================================================
 -- Setup: Create test users and data AS SUPERUSER (bypass RLS for setup)
@@ -642,6 +642,14 @@ SELECT throws_ok(
   '23514',
   NULL,
   'Test 44: service_role UPDATE of installment status blocked by trigger (23514)'
+);
+
+-- Test 45: service_role UPDATE of plan total_amount_cents blocked by trigger
+SELECT throws_ok(
+  $$UPDATE public.plans SET total_amount_cents = 999999 WHERE id = '88888888-8888-8888-8888-888888888888'$$,
+  '23514',
+  NULL,
+  'Test 45: service_role UPDATE of plan total_amount_cents blocked by trigger (23514)'
 );
 
 RESET ROLE;

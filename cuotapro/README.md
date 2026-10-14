@@ -262,8 +262,9 @@ END IF;
 - `service_role` - llamadas server-side con service key
 
 **Roles permitidos:**
-- `postgres` - conexión directa a la base
-- `supabase_admin` - funciones SECURITY DEFINER
+- `postgres` - conexión directa a la base y funciones SECURITY DEFINER (que ejecutan como su owner `postgres`)
+
+> **Nota:** Las funciones SECURITY DEFINER ejecutan como su owner (`postgres`), no como `supabase_admin`. El rol `supabase_admin` es el superusuario de la plataforma Supabase y no está involucrado en la ejecución de RPCs.
 
 > **Importante:** Ni siquiera `service_role` puede modificar `status`, `paid_cents` o `total_amount_cents` directamente. Todas las modificaciones DEBEN hacerse a través de las RPCs:
 > - `register_payment()` - para pagos

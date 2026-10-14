@@ -30,7 +30,7 @@ import {
   AlertDialogTitle,
 } from '@/components/ui/alert-dialog';
 import { toast } from 'sonner';
-import { formatCurrency, formatPercentage, calculatePenalty } from '@/lib/amortization/engine';
+import { formatCurrency, formatPercentage, calculatePenalty, parseLocalDate } from '@/lib/amortization/engine';
 import {
   CheckCircle,
   XCircle,
@@ -103,7 +103,7 @@ export default function PlanDetailPage() {
     const { data: tenantUser } = await supabase
       .from('tenant_users')
       .select('tenant_id, tenants(*)')
-      .single() as { data: { tenant_id: string; tenants: unknown } | null };
+      .maybeSingle() as { data: { tenant_id: string; tenants: unknown } | null };
 
     if (!tenantUser) {
       setError('No se encontró el tenant');
@@ -195,7 +195,7 @@ export default function PlanDetailPage() {
     const outstanding = installment.total_cents - installment.paid_cents;
     const penalty = calculatePenalty(
       outstanding,
-      new Date(installment.due_date),
+      parseLocalDate(installment.due_date),
       new Date(),
       plan?.grace_days || 0,
       plan?.penalty_rate || 0,
@@ -221,25 +221,35 @@ export default function PlanDetailPage() {
     const outstanding = selectedInstallment.total_cents - selectedInstallment.paid_cents;
     const penalty = calculatePenalty(
       outstanding,
-      new Date(selectedInstallment.due_date),
+      parseLocalDate(selectedInstallment.due_date),
       new Date(),
       plan.grace_days,
       plan.penalty_rate,
       plan.penalty_cap
     );
 
+    const maxAllowed = outstanding + penalty;
+    if (amountCents > maxAllowed) {
+      toast.error(`El monto ($${(amountCents / 100).toFixed(2)}) excede el saldo pendiente + punitorios ($${(maxAllowed / 100).toFixed(2)})`);
+      setIsProcessing(false);
+      return;
+    }
+
     const penaltyPaid = Math.min(penalty, amountCents);
-    const principalPaid = Math.min(Math.max(0, amountCents - penaltyPaid), outstanding);
+    const principalPaid = amountCents - penaltyPaid;
 
     const { data, error } = await supabase.rpc('register_payment', {
       p_installment_id: selectedInstallment.id,
       p_amount_cents: principalPaid,
       p_penalty_paid_cents: penaltyPaid,
-    }) as { data: { payment_id: string; plan_completed: boolean } | null; error: { message?: string } | null };
+    }) as { data: { payment_id: string; plan_completed: boolean } | null; error: { code?: string; message?: string } | null };
 
     if (error) {
-      const message = error.message || 'Error al registrar el pago';
-      toast.error(message);
+      if (error.code === 'P0005') {
+        toast.error('El pago excede el saldo pendiente de la cuota');
+      } else {
+        toast.error(error.message || 'Error al registrar el pago');
+      }
       setIsProcessing(false);
       return;
     }
@@ -266,7 +276,7 @@ export default function PlanDetailPage() {
 
     const phone = client.phone.replace(/\D/g, '');
     const amount = formatCurrency(installment.total_cents - installment.paid_cents);
-    const dueDate = format(new Date(installment.due_date), 'dd/MM/yyyy');
+    const dueDate = format(parseLocalDate(installment.due_date), 'dd/MM/yyyy');
 
     let message = `Hola ${client.full_name}, te recordamos que la cuota N°${installment.number} de ${plan.description} por ${amount} vence el ${dueDate}.`;
 
@@ -328,7 +338,7 @@ export default function PlanDetailPage() {
   const totalPaid = plan.installments.reduce((sum, i) => sum + i.paid_cents, 0);
   const totalPending = plan.total_amount_cents - totalPaid;
   const overdueInstallments = plan.installments.filter(
-    (i) => i.status !== 'paid' && new Date(i.due_date) < new Date()
+    (i) => i.status !== 'paid' && parseLocalDate(i.due_date) < new Date()
   );
 
   const isDraft = plan.status === 'draft';
@@ -443,7 +453,7 @@ export default function PlanDetailPage() {
                     {plan.installments.map((inst) => {
                       const isOverdue =
                         inst.status !== 'paid' &&
-                        new Date(inst.due_date) < new Date();
+                        parseLocalDate(inst.due_date) < new Date();
                       const isEditing = editingInstallment?.id === inst.id;
 
                       return (
@@ -463,7 +473,7 @@ export default function PlanDetailPage() {
                                 className="w-36"
                               />
                             ) : (
-                              format(new Date(inst.due_date), 'dd/MM/yyyy', { locale: es })
+                              format(parseLocalDate(inst.due_date), 'dd/MM/yyyy', { locale: es })
                             )}
                           </td>
                           <td className="py-3 pr-4 text-right">
@@ -697,7 +707,7 @@ export default function PlanDetailPage() {
             <DialogDescription>
               Cuota N°{selectedInstallment?.number} - Vencimiento:{' '}
               {selectedInstallment &&
-                format(new Date(selectedInstallment.due_date), 'dd/MM/yyyy')}
+                format(parseLocalDate(selectedInstallment.due_date), 'dd/MM/yyyy')}
             </DialogDescription>
           </DialogHeader>
 
@@ -720,14 +730,14 @@ export default function PlanDetailPage() {
                     )}
                   </span>
                 </div>
-                {new Date(selectedInstallment.due_date) < new Date() && plan && (
+                {parseLocalDate(selectedInstallment.due_date) < new Date() && plan && (
                   <div className="flex justify-between text-red-600">
                     <span>Punitorios</span>
                     <span>
                       {formatCurrency(
                         calculatePenalty(
                           selectedInstallment.total_cents - selectedInstallment.paid_cents,
-                          new Date(selectedInstallment.due_date),
+                          parseLocalDate(selectedInstallment.due_date),
                           new Date(),
                           plan.grace_days,
                           plan.penalty_rate,

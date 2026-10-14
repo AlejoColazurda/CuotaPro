@@ -23,6 +23,7 @@ import {
   calculateAmortization,
   formatCurrency,
   formatPercentage,
+  parseLocalDate,
   type AmortizationInput,
   type AmortizationResult,
 } from '@/lib/amortization/engine';
@@ -43,8 +44,8 @@ const planSchema = z.object({
   first_due_date: z.string().min(1, 'Seleccioná la fecha de primer vencimiento'),
   payment_day: z.number().int().min(1).max(28).optional(),
   grace_days: z.number().int().min(0),
-  penalty_rate: z.number().min(0).max(1),
-  penalty_cap: z.number().min(0).max(1),
+  penalty_rate: z.number().min(0, 'Punitorios no pueden ser negativos').max(100, 'Máximo 100%'),
+  penalty_cap: z.number().min(0, 'Tope no puede ser negativo').max(100, 'Máximo 100%'),
 });
 
 type PlanForm = z.infer<typeof planSchema>;
@@ -71,11 +72,11 @@ export default function NewPlanPage() {
       admin_fee: 0,
       num_installments: 3,
       interest_type: 'fixed_surcharge',
-      interest_rate: 0.15,
+      interest_rate: 15,
       first_due_date: format(addMonths(new Date(), 1), 'yyyy-MM-dd'),
       grace_days: 0,
-      penalty_rate: 0.001,
-      penalty_cap: 0.30,
+      penalty_rate: 0.1,
+      penalty_cap: 30,
     },
   });
 
@@ -96,7 +97,7 @@ export default function NewPlanPage() {
       const { data: tenantUser } = await supabase
         .from('tenant_users')
         .select('tenant_id')
-        .single() as { data: { tenant_id: string } | null };
+        .maybeSingle() as { data: { tenant_id: string } | null };
 
       if (!tenantUser) return;
 
@@ -123,8 +124,8 @@ export default function NewPlanPage() {
 
       if (tenantRes.data) {
         setValue('grace_days', tenantRes.data.default_grace_days);
-        setValue('penalty_rate', tenantRes.data.default_penalty_rate);
-        setValue('penalty_cap', tenantRes.data.max_penalty_cap);
+        setValue('penalty_rate', tenantRes.data.default_penalty_rate * 100);
+        setValue('penalty_cap', tenantRes.data.max_penalty_cap * 100);
       }
 
       setClients(clientsRes.data || []);
@@ -145,8 +146,8 @@ export default function NewPlanPage() {
           adminFeeCents: Math.round((adminFee || 0) * 100),
           numInstallments,
           interestType: interestType as InterestType,
-          interestRate: interestType === 'zero_interest' ? 0 : interestRate,
-          startDate: firstDueDate ? new Date(firstDueDate) : new Date(),
+          interestRate: interestType === 'zero_interest' ? 0 : (interestRate || 0) / 100,
+          startDate: firstDueDate ? parseLocalDate(firstDueDate) : new Date(),
         };
 
         const result = calculateAmortization(input);
@@ -182,13 +183,13 @@ export default function NewPlanPage() {
         total_amount_cents: simulation.totalAmountCents,
         num_installments: data.num_installments,
         interest_type: data.interest_type as InterestType,
-        interest_rate: data.interest_type === 'zero_interest' ? 0 : data.interest_rate,
+        interest_rate: data.interest_type === 'zero_interest' ? 0 : data.interest_rate / 100,
         tna: simulation.tna,
         tea: simulation.tea,
         cft: simulation.cft,
         grace_days: data.grace_days,
-        penalty_rate: data.penalty_rate,
-        penalty_cap: data.penalty_cap,
+        penalty_rate: data.penalty_rate / 100,
+        penalty_cap: data.penalty_cap / 100,
       };
 
       const { data: plan, error: planError } = await supabase
@@ -217,14 +218,6 @@ export default function NewPlanPage() {
         .insert(installmentsData as Record<string, unknown>[]);
 
       if (installmentsError) throw installmentsError;
-
-      await supabase.from('audit_log').insert({
-        tenant_id: tenantId,
-        action: 'plan_created',
-        entity_type: 'plan',
-        entity_id: plan.id,
-        new_data: planData,
-      } as Record<string, unknown>);
 
       toast.success('Plan creado como borrador');
       router.push(`/plans/${plan.id}`);
@@ -428,13 +421,10 @@ export default function NewPlanPage() {
                       <Input
                         id="interest_rate"
                         type="number"
-                        step="0.01"
+                        step="0.1"
                         min="0"
                         placeholder={interestType === 'fixed_surcharge' ? '15' : '5'}
-                        {...register('interest_rate', {
-                          valueAsNumber: true,
-                          setValueAs: (v) => parseFloat(v) / 100,
-                        })}
+                        {...register('interest_rate', { valueAsNumber: true })}
                       />
                     </div>
                   )}
@@ -471,10 +461,9 @@ export default function NewPlanPage() {
                       type="number"
                       step="0.01"
                       min="0"
-                      {...register('penalty_rate', {
-                        valueAsNumber: true,
-                        setValueAs: (v) => parseFloat(v) / 100,
-                      })}
+                      max="100"
+                      placeholder="0.1"
+                      {...register('penalty_rate', { valueAsNumber: true })}
                     />
                   </div>
 
@@ -486,10 +475,8 @@ export default function NewPlanPage() {
                       step="1"
                       min="0"
                       max="100"
-                      {...register('penalty_cap', {
-                        valueAsNumber: true,
-                        setValueAs: (v) => parseFloat(v) / 100,
-                      })}
+                      placeholder="30"
+                      {...register('penalty_cap', { valueAsNumber: true })}
                     />
                   </div>
                 </div>
