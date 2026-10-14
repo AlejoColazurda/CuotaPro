@@ -79,6 +79,9 @@ COMMENT ON FUNCTION public.calculate_penalty(BIGINT, DATE, DATE, INTEGER, NUMERI
 -- Allocation order: 1) Penalty, 2) Interest, 3) Admin fee, 4) Principal
 -- ============================================================================
 
+-- Drop old function first to allow parameter name change
+DROP FUNCTION IF EXISTS public.register_payment(UUID, BIGINT, BIGINT, TEXT, TEXT, TEXT);
+
 CREATE OR REPLACE FUNCTION public.register_payment(
   p_installment_id UUID,
   p_amount_cents BIGINT,
