@@ -20,44 +20,9 @@ const onboardingSchema = z.object({
 
 type OnboardingForm = z.infer<typeof onboardingSchema>;
 
-function generateSlug(name: string): string {
-  return name
-    .toLowerCase()
-    .normalize('NFD')
-    .replace(/[\u0300-\u036f]/g, '')
-    .replace(/[^a-z0-9\s-]/g, '')
-    .replace(/\s+/g, '-')
-    .replace(/-+/g, '-')
-    .replace(/^-|-$/g, '')
-    .slice(0, 50);
-}
-
-async function generateUniqueSlug(supabase: ReturnType<typeof createClient>, baseName: string): Promise<string> {
-  const baseSlug = generateSlug(baseName);
-  let slug = baseSlug;
-  let suffix = 1;
-
-  while (true) {
-    const { data: existing } = await supabase
-      .from('tenants')
-      .select('id')
-      .eq('slug', slug)
-      .single();
-
-    if (!existing) {
-      return slug;
-    }
-
-    slug = `${baseSlug}-${suffix}`;
-    suffix++;
-
-    if (suffix > 1000) {
-      slug = `${baseSlug}-${Date.now()}`;
-      break;
-    }
-  }
-
-  return slug;
+interface CreateTenantResult {
+  tenant_id: string;
+  slug: string;
 }
 
 export default function OnboardingPage() {
@@ -121,52 +86,32 @@ export default function OnboardingPage() {
         return;
       }
 
-      const { data: existingProfile } = await supabase
-        .from('user_profiles')
-        .select('id')
-        .eq('id', user.id)
-        .single();
+      const { data: result, error } = await supabase.rpc('create_tenant_with_owner', {
+        p_name: data.businessName,
+        p_full_name: data.fullName,
+      }) as { data: CreateTenantResult | null; error: { code?: string; message?: string } | null };
 
-      if (existingProfile) {
-        await supabase
-          .from('user_profiles')
-          .update({ full_name: data.fullName })
-          .eq('id', user.id);
-      } else {
-        await supabase.from('user_profiles').insert({
-          id: user.id,
-          email: user.email,
-          full_name: data.fullName,
-        });
-      }
-
-      const slug = await generateUniqueSlug(supabase, data.businessName);
-
-      const { data: tenant, error: tenantError } = await supabase
-        .from('tenants')
-        .insert({
-          name: data.businessName,
-          slug,
-          email: user.email,
-        })
-        .select()
-        .single() as { data: { id: string } | null; error: Error | null };
-
-      if (tenantError || !tenant) {
-        console.error('Error creating tenant:', tenantError);
-        toast.error('Error al crear el negocio');
+      if (error) {
+        console.error('Error creating tenant:', error);
+        
+        if (error.code === '23505') {
+          toast.error('Ya tenés un negocio registrado. Redirigiendo al panel...');
+          router.push('/dashboard');
+          return;
+        }
+        
+        if (error.code === 'P0001') {
+          toast.error('Error de autenticación. Volvé a iniciar sesión.');
+          router.push('/login');
+          return;
+        }
+        
+        toast.error('No se pudo crear el negocio. Intentá de nuevo.');
         return;
       }
 
-      const { error: linkError } = await supabase.from('tenant_users').insert({
-        tenant_id: tenant.id,
-        user_id: user.id,
-        role: 'owner',
-      });
-
-      if (linkError) {
-        console.error('Error linking user to tenant:', linkError);
-        toast.error('Error al vincular el usuario');
+      if (!result) {
+        toast.error('Error inesperado al crear el negocio.');
         return;
       }
 
@@ -174,7 +119,7 @@ export default function OnboardingPage() {
       router.push('/dashboard');
     } catch (error) {
       console.error('Onboarding error:', error);
-      toast.error('Error al completar el registro');
+      toast.error('Error al completar el registro. Intentá de nuevo.');
     } finally {
       setIsLoading(false);
     }
