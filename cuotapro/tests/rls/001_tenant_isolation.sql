@@ -95,8 +95,8 @@ SET LOCAL ROLE authenticated;
 
 SELECT is(
   (SELECT COUNT(*) FROM public.tenants)::integer,
-  1,
-  'Test 1: User 1 should only see their own tenant'
+  999,
+  'Test 1: DELIBERATELY BROKEN - User 1 should only see their own tenant'
 );
 
 SELECT is(
