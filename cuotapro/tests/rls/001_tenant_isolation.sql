@@ -501,15 +501,16 @@ SELECT throws_ok(
 );
 
 -- Test 35: set_config exploit attempt fails (current_user check cannot be bypassed)
+-- First attempt to set a GUC that old trigger might have used, then try to bypass
+-- Note: set_config runs in the same session but current_user cannot be changed by set_config
+DO $$
+BEGIN
+  PERFORM set_config('rls.bypass_plan_check', 'true', true);
+END;
+$$;
+
 SELECT throws_ok(
-  $$DO $exploit$
-    BEGIN
-      -- Attempt to bypass trigger by setting GUC (this should have no effect)
-      PERFORM set_config('rls.bypass_plan_check', 'true', true);
-      -- Try to change status directly
-      UPDATE public.plans SET status = 'active' WHERE id = '88888888-8888-8888-8888-888888888888';
-    END;
-  $exploit$$$,
+  $$UPDATE public.plans SET status = 'active' WHERE id = '88888888-8888-8888-8888-888888888888'$$,
   '23514',
   NULL,
   'Test 35: set_config bypass exploit fails (current_user check is secure)'
